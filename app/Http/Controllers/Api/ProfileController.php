@@ -104,11 +104,21 @@ class ProfileController extends Controller
         return response()->json(auth('api')->user()->favorites);
     }
 
-    public function toggleFavorite($restaurantId)
+    public function addFavorite($restaurantId)
     {
         $user = auth('api')->user();
-        $user->favorites()->toggle($restaurantId);
+        if (!$user->favorites()->where('restaurant_id', $restaurantId)->exists()) {
+            $user->favorites()->attach($restaurantId);
+        }
         
-        return response()->json(['message' => 'Favorites updated']);
+        return response()->json(['message' => 'Restaurant added to favorites']);
+    }
+
+    public function removeFavorite($restaurantId)
+    {
+        $user = auth('api')->user();
+        $user->favorites()->detach($restaurantId);
+        
+        return response()->json(['message' => 'Restaurant removed from favorites']);
     }
 }

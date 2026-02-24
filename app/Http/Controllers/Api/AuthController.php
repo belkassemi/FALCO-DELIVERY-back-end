@@ -51,9 +51,9 @@ class AuthController extends Controller
         }
 
         $user = auth('api')->user();
-        if ($user->is_blocked) {
+        if ($user->status !== 'active') {
             auth('api')->logout();
-            return response()->json(['error' => 'Account is blocked'], 403);
+            return response()->json(['error' => 'Account is ' . $user->status], 403);
         }
 
         return $this->respondWithToken($token);

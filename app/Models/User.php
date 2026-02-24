@@ -12,7 +12,7 @@ class User extends Authenticatable implements JWTSubject
     use HasFactory, Notifiable;
 
     protected $fillable = [
-        'name', 'email', 'phone', 'password', 'avatar', 'role', 'is_blocked', 'phone_verified_at',
+        'name', 'email', 'phone', 'password', 'avatar', 'role', 'status', 'phone_verified_at',
         'activation_code', 'activation_expires_at', 'activation_attempts', 'is_activated', 'activation_locked_at'
     ];
 
@@ -20,7 +20,6 @@ class User extends Authenticatable implements JWTSubject
 
     protected $casts = [
         'email_verified_at' => 'datetime',
-        'is_blocked'        => 'boolean',
     ];
 
     // JWT

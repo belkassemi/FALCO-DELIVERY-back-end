@@ -33,8 +33,10 @@ Route::group(['middleware' => 'auth:api'], function () {
     Route::get('profile/addresses', [ProfileController::class, 'getAddresses']);
     Route::post('profile/addresses', [ProfileController::class, 'addAddress']);
     Route::delete('profile/addresses/{id}', [ProfileController::class, 'deleteAddress']);
+    // Profile Favorites
     Route::get('profile/favorites', [ProfileController::class, 'getFavorites']);
-    Route::post('profile/favorites/{id}', [ProfileController::class, 'toggleFavorite']);
+    Route::post('profile/favorites/{restaurantId}', [ProfileController::class, 'addFavorite']);
+    Route::delete('profile/favorites/{restaurantId}', [ProfileController::class, 'removeFavorite']);
 
     // Restaurants (Customer view)
     Route::get('restaurants', [RestaurantController::class, 'index']);
@@ -45,10 +47,10 @@ Route::group(['middleware' => 'auth:api'], function () {
     // Orders (Customer)
     Route::group(['middleware' => RoleMiddleware::class . ':customer'], function () {
         Route::get('orders', [OrderController::class, 'history']);
-        Route::post('orders/create', [OrderController::class, 'store']);
+        Route::post('orders', [OrderController::class, 'store']); // Was orders/create
         Route::post('orders/pharmacy', [OrderController::class, 'store']); // Uses same logic with redirect
-        Route::put('orders/{id}/cancel', [OrderController::class, 'cancel']);
-        Route::get('orders/{id}/track', [OrderController::class, 'track']);
+        Route::patch('orders/{id}/cancel', [OrderController::class, 'cancel']); // Was put orders/{id}/cancel
+        Route::get('orders/{id}/tracking', [OrderController::class, 'track']); // Was orders/{id}/track
     });
 
     // Courier Operations
@@ -57,7 +59,10 @@ Route::group(['middleware' => 'auth:api'], function () {
 
         Route::group(['middleware' => 'courier.activated'], function () {
             Route::put('status', [CourierController::class, 'updateStatus']);
-            Route::put('location', [CourierController::class, 'updateLocation']);
+            
+            // Apply rate limiting: 12 requests per minute (approx 1 per 5 seconds)
+            Route::put('location', [CourierController::class, 'updateLocation'])->middleware('throttle:12,1');
+            
             Route::get('orders/history', [CourierController::class, 'history']);
             Route::post('orders/{id}/accept', [CourierController::class, 'acceptOrder']);
             Route::post('orders/{id}/pickup', [CourierController::class, 'pickupOrder']);
@@ -83,7 +88,7 @@ Route::group(['middleware' => 'auth:api'], function () {
     // Admin Panel
     Route::group(['prefix' => 'admin', 'middleware' => RoleMiddleware::class . ':admin'], function () {
         Route::get('users', [AdminController::class, 'users']);
-        Route::put('users/{id}/block', [AdminController::class, 'blockUser']);
+        Route::patch('users/{id}/status', [AdminController::class, 'updateStatus']); // Was put block
         Route::post('couriers', [AdminController::class, 'createCourier']);
         Route::get('restaurants/pending', [AdminController::class, 'pendingRestaurants']);
         Route::post('restaurants/{id}/approve', [AdminController::class, 'approveRestaurant']);

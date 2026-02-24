@@ -41,8 +41,8 @@ class CourierController extends Controller
     public function updateLocation(Request $request)
     {
         $request->validate([
-            'lat' => 'required|numeric',
-            'lng' => 'required|numeric',
+            'lat' => 'required|numeric|between:-90,90',
+            'lng' => 'required|numeric|between:-180,180',
         ]);
 
         $courier = auth('api')->user();
@@ -69,8 +69,12 @@ class CourierController extends Controller
     {
         $order = Order::findOrFail($id);
         
+        if ($order->status !== 'pending') {
+            return response()->json(['error' => 'Order cannot be accepted because it is no longer pending.'], 400);
+        }
+
         if ($order->courier_id !== null) {
-            return response()->json(['message' => 'Order already accepted by another courier'], 400);
+            return response()->json(['error' => 'Order already accepted by another courier.'], 400);
         }
 
         $order->update([

@@ -19,14 +19,24 @@ class AdminController extends Controller
         return response()->json(User::paginate(20));
     }
 
-    public function blockUser($id)
+    public function updateStatus(Request $request, $id)
     {
+        $request->validate([
+            'status' => 'required|in:active,suspended,banned'
+        ]);
+
         $user = User::findOrFail($id);
-        $user->update(['is_blocked' => !$user->is_blocked]);
+        
+        // Prevent admins from changing their own status via this generic endpoint
+        if ($user->id === auth('api')->id()) {
+            return response()->json(['error' => 'Cannot change your own status'], 403);
+        }
+
+        $user->update(['status' => $request->status]);
         
         return response()->json([
-            'message' => $user->is_blocked ? 'User blocked' : 'User unblocked',
-            'is_blocked' => $user->is_blocked
+            'message' => 'User status updated to ' . $user->status,
+            'status' => $user->status
         ]);
     }
 
