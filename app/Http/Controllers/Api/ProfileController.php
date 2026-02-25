@@ -85,7 +85,9 @@ class ProfileController extends Controller
             [$request->lng, $request->lat, $address->id]
         );
 
-        return response()->json($address->refresh(), 201);
+        $newAddress = $user->addresses()->withCoordinates()->find($address->id);
+
+        return response()->json($newAddress, 201);
     }
 
     public function deleteAddress($id)

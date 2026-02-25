@@ -3,10 +3,15 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletes;
 
 class Review extends Model
 {
-    protected $fillable = ['order_id', 'customer_id', 'restaurant_id', 'rating', 'comment'];
+    use SoftDeletes;
+
+    protected $fillable = ['order_id', 'user_id', 'restaurant_id', 'rating', 'comment'];
+
+    protected $casts = ['created_at' => 'datetime'];
 
     public function order()
     {

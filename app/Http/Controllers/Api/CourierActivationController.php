@@ -42,7 +42,7 @@ class CourierActivationController extends Controller
                     'activation_expires_at' => null,
                 ]);
 
-                return response()->json(['message' => 'Account successfully activated!']);
+                return response()->json(['message' => 'Courier account activated successfully']);
             }
 
             // Failed attempt

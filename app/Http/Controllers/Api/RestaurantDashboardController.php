@@ -54,10 +54,49 @@ class RestaurantDashboardController extends Controller
         return response()->json(['message' => 'Profile updated']);
     }
 
+    public function uploadImage(Request $request)
+    {
+        $request->validate([
+            'image' => 'required|image|mimes:jpeg,png,jpg|max:5120', // allow up to 5MB
+        ]);
+
+        $restaurant = auth('api')->user()->restaurant;
+
+        if ($request->hasFile('image')) {
+            // Delete old image if it exists
+            if ($restaurant->image) {
+                Storage::disk('public')->delete($restaurant->image);
+            }
+            
+            // Store new image in 'restaurants' folder
+            $path = $request->file('image')->store('restaurants', 'public');
+            
+            // Generate full URL
+            $fullUrl = url('storage/' . $path);
+            $restaurant->update(['image' => $fullUrl]);
+
+            return response()->json([
+                'message'   => 'Restaurant image uploaded successfully',
+                'image_url' => $fullUrl
+            ]);
+        }
+
+        return response()->json(['error' => 'No image provided'], 400);
+    }
+
     public function updateStatus(Request $request)
     {
         $request->validate(['is_open' => 'required|boolean']);
-        $restaurant = auth('api')->user()->restaurant;
+        $owner      = auth('api')->user();
+        $restaurant = $owner->restaurant;
+
+        // Block opening if account is suspended or banned
+        if ($request->is_open && $owner->status !== 'active') {
+            return response()->json([
+                'error' => 'Cannot open restaurant while account is ' . $owner->status . '.'
+            ], 403);
+        }
+
         $restaurant->update(['is_open' => $request->is_open]);
 
         return response()->json(['message' => 'Status updated', 'is_open' => $restaurant->is_open]);
@@ -93,7 +132,10 @@ class RestaurantDashboardController extends Controller
             'requested_by'  => auth('api')->id(),
         ]);
 
-        return response()->json(['message' => 'Menu item creation request submitted for admin approval.'], 201);
+        return response()->json([
+            'message' => 'Menu change request submitted',
+            'request_status' => 'pending_admin_approval'
+        ], 201);
     }
 
     public function updateMenuItem(Request $request, $id)
@@ -161,16 +203,30 @@ class RestaurantDashboardController extends Controller
         return response()->json(['message' => 'Order marked as ready', 'status' => 'on_the_way']);
     }
 
-    public function analytics()
+    public function getMenu()
     {
         $restaurant = auth('api')->user()->restaurant;
-        $totalOrders = $restaurant->orders()->count();
-        $totalRevenue = $restaurant->orders()->where('status', 'delivered')->sum('total_price');
+        return response()->json($restaurant->menuItems()->get());
+    }
 
-        return response()->json([
-            'total_orders'  => $totalOrders,
-            'total_revenue' => $totalRevenue,
-            'avg_rating'    => $restaurant->rating
-        ]);
+    public function orderHistory()
+    {
+        $restaurant = auth('api')->user()->restaurant;
+        return response()->json(
+            $restaurant->orders()
+                ->where('status', 'delivered')
+                ->with('items.menuItem', 'customer')
+                ->latest()
+                ->paginate(20)
+        );
+    }
+
+    public function rejectOrder($id)
+    {
+        $order = Order::findOrFail($id);
+        $this->authorize('restaurantAction', $order);
+
+        $order->update(['status' => 'cancelled']);
+        return response()->json(['message' => 'Order rejected by restaurant.', 'status' => 'cancelled']);
     }
 }

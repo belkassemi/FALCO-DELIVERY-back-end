@@ -62,37 +62,39 @@ class CourierController extends Controller
             broadcast(new OrderLocationUpdateEvent($order->id, $request->lat, $request->lng));
         }
 
-        return response()->json(['message' => 'Location updated']);
+        return response()->json(['message' => 'Location updated successfully']);
     }
 
     public function acceptOrder($id)
     {
-        $order = Order::findOrFail($id);
-        
-        if ($order->status !== 'pending') {
-            return response()->json(['error' => 'Order cannot be accepted because it is no longer pending.'], 400);
-        }
+        return DB::transaction(function () use ($id) {
+            // Atomic lock: first courier wins, all others get 409
+            $order = Order::lockForUpdate()->findOrFail($id);
 
-        if ($order->courier_id !== null) {
-            return response()->json(['error' => 'Order already accepted by another courier.'], 400);
-        }
+            if ($order->status !== 'pending') {
+                return response()->json(['error' => 'Order cannot be accepted because it is no longer pending.'], 400);
+            }
 
-        $order->update([
-            'courier_id' => auth('api')->id(),
-            'status'     => 'assigned'
-        ]);
+            if ($order->courier_id !== null) {
+                return response()->json(['error' => 'Order already accepted by another courier.'], 409);
+            }
 
-        // Mark the dispatch log as accepted
-        OrderDispatchLog::where('order_id', $id)
-            ->where('courier_id', auth('api')->id())
-            ->update(['status' => 'accepted', 'responded_at' => now()]);
+            $order->update([
+                'courier_id' => auth('api')->id(),
+                'status'     => 'assigned'
+            ]);
 
-        broadcast(new OrderAssignedEvent($order));
+            OrderDispatchLog::where('order_id', $id)
+                ->where('courier_id', auth('api')->id())
+                ->update(['status' => 'accepted', 'responded_at' => now()]);
 
-        return response()->json([
-            'message' => 'Order assigned successfully',
-            'orderStatus' => 'assigned'
-        ]);
+            broadcast(new OrderAssignedEvent($order));
+
+            return response()->json([
+                'message'     => 'Order assigned successfully',
+                'orderStatus' => 'assigned'
+            ]);
+        });
     }
 
     public function pickupOrder($id)
@@ -109,12 +111,53 @@ class CourierController extends Controller
         return response()->json(['message' => 'Order delivered', 'status' => 'delivered']);
     }
 
-    public function earnings()
+    public function rejectOrder($id)
     {
-        $earnings = auth('api')->user()->courierOrders()
-            ->where('status', 'delivered')
-            ->sum('delivery_fee');
+        $courierId = auth('api')->id();
 
-        return response()->json(['total_earnings' => $earnings]);
+        OrderDispatchLog::where('order_id', $id)
+            ->where('courier_id', $courierId)
+            ->update(['status' => 'rejected', 'responded_at' => now()]);
+
+        return response()->json(['message' => 'Order rejected.']);
+    }
+
+    public function availableOrders()
+    {
+        $orders = Order::where('status', 'pending')
+            ->whereNull('courier_id')
+            ->with('restaurant', 'customer')
+            ->latest()
+            ->get();
+
+        return response()->json($orders);
+    }
+
+    public function withdrawRequest(Request $request)
+    {
+        $request->validate(['amount' => 'required|numeric|min:1']);
+
+        $courier  = auth('api')->user();
+        $earnings = $courier->courierOrders()->where('status', 'delivered')->sum('delivery_fee');
+
+        if ($request->amount > $earnings) {
+            return response()->json(['error' => 'Requested amount exceeds your available earnings.'], 400);
+        }
+
+        $withdraw = \App\Models\WithdrawalRequest::create([
+            'courier_id' => $courier->id,
+            'amount'     => $request->amount,
+        ]);
+
+        return response()->json(['message' => 'Withdrawal request submitted.', 'request_id' => $withdraw->id], 201);
+    }
+
+    public function withdrawHistory()
+    {
+        $history = \App\Models\WithdrawalRequest::where('courier_id', auth('api')->id())
+            ->latest()
+            ->get();
+
+        return response()->json($history);
     }
 }

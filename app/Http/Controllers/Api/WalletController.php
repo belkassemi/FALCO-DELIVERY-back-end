@@ -21,7 +21,7 @@ class WalletController extends Controller
         $wallet = auth('api')->user()->wallet;
         $wallet->credit($request->amount, 'top_up', 'Wallet top-up');
 
-        return response()->json(['message' => 'Wallet topped up', 'balance' => $wallet->balance]);
+        return response()->json(['message' => 'Wallet topped up successfully', 'balance' => $wallet->balance]);
     }
 
     public function refund(Request $request)

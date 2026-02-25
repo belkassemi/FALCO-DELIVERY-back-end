@@ -37,6 +37,15 @@ class OrderController extends Controller
             $totalPrice = 0;
             $orderItems = [];
 
+            // Restaurant guards: must be open and owner active
+            $restaurant = \App\Models\Restaurant::findOrFail($request->restaurant_id);
+            if (!$restaurant->is_open) {
+                return response()->json(['error' => 'This restaurant is currently closed.'], 400);
+            }
+            if ($restaurant->owner && $restaurant->owner->status !== 'active') {
+                return response()->json(['error' => 'This restaurant is not available.'], 400);
+            }
+
             foreach ($request->items as $itemData) {
                 $menuItem = MenuItem::findOrFail($itemData['id']);
                 
@@ -74,9 +83,10 @@ class OrderController extends Controller
             $this->dispatchService->dispatchOrder($order);
 
             return response()->json([
-                'orderId' => $order->id,
-                'status'  => $order->status,
-                'message' => 'Order placed successfully'
+                'order_id'    => $order->id,
+                'status'      => $order->status,
+                'total_price' => $order->total_price,
+                'message'     => 'Order created successfully'
             ], 201);
         });
     }
@@ -90,7 +100,10 @@ class OrderController extends Controller
         $order->update(['status' => 'cancelled']);
         $this->logService->log('order_cancelled', $order);
 
-        return response()->json(['message' => 'Order cancelled successfully']);
+        return response()->json([
+            'message' => 'Order cancelled successfully',
+            'status'  => 'cancelled'
+        ]);
     }
 
     public function track($id)
@@ -101,6 +114,7 @@ class OrderController extends Controller
         }])->findOrFail($id);
         
         return response()->json([
+            'order_id' => $order->id,
             'status' => $order->status,
             'courierLocation' => ($order->courier && $order->courier->courierLocation) ? [
                 'lat' => $order->courier->courierLocation->lat_val,
@@ -109,8 +123,37 @@ class OrderController extends Controller
         ]);
     }
 
-    public function history()
+    public function show($id)
     {
-        return response()->json(auth('api')->user()->orders()->with('restaurant')->latest()->get());
+        $order = Order::with(['items.menuItem', 'restaurant', 'courier'])
+            ->where('customer_id', auth('api')->id())
+            ->findOrFail($id);
+
+        return response()->json($order);
+    }
+
+    public function confirmDelivery($id)
+    {
+        $order = Order::where('customer_id', auth('api')->id())->findOrFail($id);
+
+        if ($order->status !== 'on_the_way') {
+            return response()->json(['error' => 'Order must be on the way before confirming delivery.'], 400);
+        }
+
+        $order->update(['status' => 'delivered', 'payment_status' => 'paid']);
+        $this->logService->log('delivery_confirmed', $order);
+
+        return response()->json(['message' => 'Delivery confirmed. Thank you!', 'status' => 'delivered']);
+    }
+
+    public function reportIssue(Request $request, $id)
+    {
+        $request->validate(['issue' => 'required|string|max:1000']);
+
+        $order = Order::where('customer_id', auth('api')->id())->findOrFail($id);
+
+        $this->logService->log('issue_reported', $order, ['issue' => $request->issue]);
+
+        return response()->json(['message' => 'Issue reported successfully. Our team will review it shortly.']);
     }
 }
