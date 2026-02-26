@@ -26,7 +26,7 @@ class AdminController extends Controller
 
     public function showUser($id)
     {
-        return response()->json(User::with('wallet', 'orders')->findOrFail($id));
+        return response()->json(User::with('orders')->findOrFail($id));
     }
 
     public function updateStatus(Request $request, $id)

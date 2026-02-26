@@ -94,12 +94,9 @@
 
 ---
 
-## 7. Global Services (Wallet, Promotions, Notifications)
+## 7. Global Services (Promotions, Notifications)
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/wallet` | View current user wallet balance |
-| `POST` | `/api/wallet/top-up` | Add funds to user wallet |
-| `GET` | `/api/wallet/history` | View wallet transaction ledger |
 | `GET` | `/api/promotions` | List available promotions & coupons |
 | `POST` | `/api/promotions/apply` | Validate & apply promo code to cart |
 | `GET` | `/api/notifications` | List user in-app notifications |

@@ -15,7 +15,7 @@ use App\Http\Controllers\Api\StoreController;
 use App\Http\Controllers\Api\StoreDashboardController;
 use App\Http\Controllers\Api\ReviewController;
 use App\Http\Controllers\Api\SocketController;
-use App\Http\Controllers\Api\WalletController;
+
 use App\Http\Middleware\RoleMiddleware;
 use Illuminate\Support\Facades\Route;
 
@@ -205,13 +205,6 @@ Route::group(['middleware' => 'auth:api'], function () {
         Route::get('login-attempts',                    [AuditController::class, 'loginAttempts']);
         Route::get('system-health',                     [AuditController::class, 'systemHealth']);
     });
-
-    // ============================================================
-    // WALLET (customer only — PRD: no wallet for couriers)
-    // ============================================================
-    Route::get('wallet',                [WalletController::class, 'show']);
-    Route::post('wallet/top-up',        [WalletController::class, 'topUp']);
-    Route::get('wallet/history',        [WalletController::class, 'history']);
 
     // ============================================================
     // PAYMENTS

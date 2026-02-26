@@ -5,7 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\User;
 use App\Models\TosAcceptance;
-use App\Models\Wallet;
+
 use App\Services\OtpService;
 use App\Services\SmsService;
 use Illuminate\Http\Request;
@@ -86,8 +86,7 @@ class AuthController extends Controller
                 'phone_verified_at' => now(),
             ]);
 
-            // Create wallet for customer
-            Wallet::create(['user_id' => $user->id, 'balance' => 0]);
+
         } else {
             // Update phone_verified_at if not already set
             if (!$user->phone_verified_at) {
@@ -156,7 +155,7 @@ class AuthController extends Controller
                 'role'     => 'restaurant_owner',
             ]);
 
-            Wallet::create(['user_id' => $user->id, 'balance' => 0]);
+
 
             if ($request->hasFile('image')) {
                 $path = $request->file('image')->store('stores', 'public');

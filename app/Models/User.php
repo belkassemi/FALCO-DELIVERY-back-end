@@ -73,10 +73,7 @@ class User extends Authenticatable implements JWTSubject
         return $this->belongsToMany(Store::class, 'favorites', 'user_id', 'store_id');
     }
 
-    public function wallet()
-    {
-        return $this->hasOne(Wallet::class);
-    }
+
 
     public function courierLocation()
     {

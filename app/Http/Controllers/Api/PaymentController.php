@@ -19,7 +19,7 @@ class PaymentController extends Controller
     {
         $request->validate([
             'order_id'       => 'required|exists:orders,id',
-            'payment_method' => 'required|in:card,wallet,cash',
+            'payment_method' => 'required|in:card,cash',
         ]);
 
         $order = Order::findOrFail($request->order_id);
@@ -48,16 +48,7 @@ class PaymentController extends Controller
         }
 
         return DB::transaction(function () use ($request, $order) {
-            // If paying by wallet, deduct immediately
-            if ($request->payment_method === 'wallet') {
-                $wallet = auth('api')->user()->wallet;
-                if ($wallet->balance < $order->total_price) {
-                    return response()->json(['error' => 'Insufficient wallet balance.'], 400);
-                }
-                $wallet->debit($order->total_price, 'order_payment', 'Payment for order #' . $order->id);
-            }
-
-            $paymentStatus = in_array($request->payment_method, ['wallet', 'card']) ? 'completed' : 'pending';
+            $paymentStatus = $request->payment_method === 'card' ? 'completed' : 'pending';
 
             $payment = Payment::create([
                 'order_id' => $order->id,
