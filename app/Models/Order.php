@@ -10,14 +10,18 @@ class Order extends Model
     use HasFactory;
 
     protected $fillable = [
-        'customer_id', 'restaurant_id', 'courier_id', 'address_id',
-        'status', 'total_price', 'delivery_fee', 'estimated_time',
-        'cancel_reason', 'payment_method', 'payment_status', 'notes',
+        'customer_id', 'store_id', 'courier_id', 'address_id',
+        'status', 'total_price', 'delivery_fee', 'delivery_distance_km',
+        'estimated_time', 'cancel_reason', 'payment_method', 'payment_status',
+        'notes', 'age_confirmation', 'age_confirmation_at',
     ];
 
     protected $casts = [
-        'total_price'  => 'float',
-        'delivery_fee' => 'float',
+        'total_price'          => 'float',
+        'delivery_fee'         => 'float',
+        'delivery_distance_km' => 'float',
+        'age_confirmation'     => 'boolean',
+        'age_confirmation_at'  => 'datetime',
     ];
 
     const STATUS_PENDING    = 'pending';
@@ -33,9 +37,15 @@ class Order extends Model
         return $this->belongsTo(User::class, 'customer_id');
     }
 
+    public function store()
+    {
+        return $this->belongsTo(Store::class);
+    }
+
+    // Backward compat alias
     public function restaurant()
     {
-        return $this->belongsTo(Restaurant::class);
+        return $this->store();
     }
 
     public function courier()
@@ -71,5 +81,12 @@ class Order extends Model
     public function canBeCancelled(): bool
     {
         return $this->status === self::STATUS_PENDING;
+    }
+
+    public function hasAgeRestrictedItems(): bool
+    {
+        return $this->items()
+            ->whereHas('product', fn($q) => $q->where('is_age_restricted', true))
+            ->exists();
     }
 }

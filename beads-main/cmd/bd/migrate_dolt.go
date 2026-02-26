@@ -1,0 +1,552 @@
+//go:build cgo
+
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/ui"
+
+	_ "github.com/ncruces/go-sqlite3/driver"
+	_ "github.com/ncruces/go-sqlite3/embed"
+)
+
+// handleToDoltMigration migrates from SQLite to Dolt backend.
+// 1. Finds SQLite .db files in .beads/
+// 2. Creates Dolt database in `.beads/dolt/`
+// 3. Imports all issues, labels, dependencies, events
+// 4. Copies all config values
+// 5. Updates `metadata.json` to use Dolt
+func handleToDoltMigration(dryRun bool, autoYes bool) {
+	ctx := context.Background()
+
+	// Find .beads directory
+	beadsDir := beads.FindBeadsDir()
+	if beadsDir == "" {
+		exitWithError("no_beads_directory", "No .beads directory found. Run 'bd init' first.",
+			"run 'bd init' to initialize bd")
+	}
+
+	// Find SQLite database by scanning for .db files
+	sqlitePath := findSQLiteDB(beadsDir)
+	if sqlitePath == "" {
+		exitWithError("no_sqlite_database", "No SQLite database found to migrate",
+			"no .db files found in "+beadsDir)
+	}
+
+	// Dolt path
+	doltPath := filepath.Join(beadsDir, "dolt")
+
+	// Track whether the dolt directory pre-existed so cleanup doesn't
+	// destroy data from a prior migration or server start.
+	doltDirExisted := false
+	if _, err := os.Stat(doltPath); err == nil {
+		doltDirExisted = true
+	}
+
+	// Extract all data from SQLite
+	data, err := extractFromSQLite(ctx, sqlitePath)
+	if err != nil {
+		exitWithError("extraction_failed", err.Error(), "")
+	}
+
+	// Show migration plan
+	printMigrationPlan("SQLite to Dolt", sqlitePath, doltPath, data)
+
+	// Dry run mode
+	if dryRun {
+		printDryRun(sqlitePath, doltPath, data, true)
+		return
+	}
+
+	// Prompt for confirmation
+	if !autoYes && !jsonOutput {
+		if !confirmBackendMigration("SQLite", "Dolt", true) {
+			fmt.Println("Migration canceled")
+			return
+		}
+	}
+
+	// Create backup
+	backupPath := strings.TrimSuffix(sqlitePath, ".db") + ".backup-pre-dolt-" + time.Now().Format("20060102-150405") + ".db"
+	if err := copyFile(sqlitePath, backupPath); err != nil {
+		exitWithError("backup_failed", err.Error(), "")
+	}
+	printSuccess(fmt.Sprintf("Created backup: %s", filepath.Base(backupPath)))
+
+	// Create Dolt database
+	printProgress("Creating Dolt database...")
+
+	// Respect existing config's database name to avoid creating phantom catalog
+	// entries when a user has renamed their database (GH#2051).
+	dbName := ""
+	if existingCfg, _ := configfile.Load(beadsDir); existingCfg != nil && existingCfg.DoltDatabase != "" {
+		dbName = existingCfg.DoltDatabase
+	} else if data.prefix != "" {
+		dbName = data.prefix
+	} else {
+		dbName = "beads"
+	}
+	doltStore, err := dolt.New(ctx, &dolt.Config{
+		Path:      doltPath,
+		Database:  dbName,
+		AutoStart: os.Getenv("GT_ROOT") == "" && os.Getenv("BEADS_DOLT_AUTO_START") != "0",
+	})
+	if err != nil {
+		exitWithError("dolt_create_failed", err.Error(), "")
+	}
+
+	// Import data with cleanup on failure
+	imported, skipped, importErr := importToDolt(ctx, doltStore, data)
+	if importErr != nil {
+		_ = doltStore.Close()
+		if !doltDirExisted {
+			_ = os.RemoveAll(doltPath)
+		}
+		hint := "import failed"
+		if !doltDirExisted {
+			hint = "partial Dolt directory has been cleaned up"
+		}
+		exitWithError("import_failed", importErr.Error(), hint)
+	}
+
+	// Set sync.mode to dolt-native in the DB.
+	if err := doltStore.SetConfig(ctx, "sync.mode", "dolt-native"); err != nil {
+		printWarning(fmt.Sprintf("failed to set sync.mode in DB: %v", err))
+	} else {
+		printSuccess("Set sync.mode = dolt-native in database")
+	}
+
+	// Commit the migration
+	commitMsg := fmt.Sprintf("Migrate from SQLite: %d issues imported", imported)
+	if err := doltStore.Commit(ctx, commitMsg); err != nil {
+		printWarning(fmt.Sprintf("failed to create Dolt commit: %v", err))
+	}
+
+	_ = doltStore.Close()
+
+	printSuccess(fmt.Sprintf("Imported %d issues (%d skipped)", imported, skipped))
+
+	// Load and update metadata.json
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil {
+		cfg = configfile.DefaultConfig()
+	}
+	if cfg == nil {
+		cfg = configfile.DefaultConfig()
+	}
+	cfg.Backend = configfile.BackendDolt
+	cfg.Database = "dolt"
+	cfg.DoltDatabase = dbName
+	// Don't set DoltServerPort — let doltserver.DefaultConfig derive it from
+	// the project path at runtime. Writing an explicit port here would freeze
+	// a value that conflicts with the hash-based port in doltserver.DerivePort.
+	if err := cfg.Save(beadsDir); err != nil {
+		exitWithError("config_save_failed", err.Error(),
+			"data was imported but metadata.json was not updated - manually set backend to 'dolt'")
+	}
+
+	printSuccess("Updated metadata.json to use Dolt backend")
+
+	// Write sync.mode to config.yaml so viper-based code reads the correct mode.
+	// The DB config table was already updated above; this fixes the split-brain
+	// where config.yaml still says "git-portable" (GH #1723, #1794).
+	if err := config.SaveConfigValue("sync.mode", string(config.SyncModeDoltNative), beadsDir); err != nil {
+		printWarning(fmt.Sprintf("failed to write sync.mode to config.yaml: %v (set manually: sync.mode: dolt-native)", err))
+	} else {
+		printSuccess("Set sync.mode = dolt-native in config.yaml")
+	}
+
+	// Check if git hooks need updating for Dolt compatibility
+	if hooksNeedDoltUpdate(beadsDir) {
+		printWarning("Git hooks need updating for Dolt backend")
+		if !jsonOutput {
+			fmt.Println("  The pre-commit and post-merge hooks use JSONL sync which doesn't apply to Dolt.")
+			fmt.Println("  Run 'bd hooks install --force' to update them.")
+		}
+	}
+
+	// Final status
+	printFinalStatus("dolt", imported, skipped, backupPath, doltPath, sqlitePath, true)
+}
+
+// hooksNeedDoltUpdate checks if installed git hooks lack the Dolt backend skip logic.
+func hooksNeedDoltUpdate(beadsDir string) bool {
+	repoRoot := filepath.Dir(beadsDir)
+	hooksDir := filepath.Join(repoRoot, ".git", "hooks")
+
+	postMergePath := filepath.Join(hooksDir, "post-merge")
+	// #nosec G304 -- postMergePath is derived from the local repo's .git/hooks directory.
+	content, err := os.ReadFile(postMergePath)
+	if err != nil {
+		return false
+	}
+
+	contentStr := string(content)
+
+	if strings.Contains(contentStr, "bd-shim") {
+		return false
+	}
+	if !strings.Contains(contentStr, "bd") {
+		return false
+	}
+	if strings.Contains(contentStr, `"backend"`) && strings.Contains(contentStr, `"dolt"`) {
+		return false
+	}
+	return true
+}
+
+// extractFromSQLite extracts all data from a SQLite database using raw SQL.
+// This is the CGO path — it reads SQLite directly via the ncruces/go-sqlite3 driver.
+// For non-CGO builds, see migrate_shim.go which uses the sqlite3 CLI instead.
+func extractFromSQLite(ctx context.Context, dbPath string) (*migrationData, error) {
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open SQLite database: %w", err)
+	}
+	defer db.Close()
+
+	// Get prefix from config table
+	prefix := ""
+	_ = db.QueryRowContext(ctx, "SELECT value FROM config WHERE key = 'issue_prefix'").Scan(&prefix)
+
+	// Get all config
+	config := make(map[string]string)
+	configRows, err := db.QueryContext(ctx, "SELECT key, value FROM config")
+	if err == nil {
+		defer configRows.Close()
+		for configRows.Next() {
+			var k, v string
+			if err := configRows.Scan(&k, &v); err == nil {
+				config[k] = v
+			}
+		}
+	}
+
+	// Get all issues
+	issueRows, err := db.QueryContext(ctx, `
+		SELECT id, COALESCE(content_hash,''), COALESCE(title,''), COALESCE(description,''),
+			COALESCE(design,''), COALESCE(acceptance_criteria,''), COALESCE(notes,''),
+			COALESCE(status,''), COALESCE(priority,0), COALESCE(issue_type,''),
+			COALESCE(assignee,''), estimated_minutes,
+			COALESCE(created_at,''), COALESCE(created_by,''), COALESCE(owner,''),
+			COALESCE(updated_at,''), COALESCE(closed_at,''), external_ref,
+			COALESCE(compaction_level,0), COALESCE(compacted_at,''), compacted_at_commit,
+			COALESCE(original_size,0),
+			COALESCE(sender,''), COALESCE(ephemeral,0), COALESCE(pinned,0),
+			COALESCE(is_template,0), COALESCE(crystallizes,0),
+			COALESCE(mol_type,''), COALESCE(work_type,''), quality_score,
+			COALESCE(source_system,''), COALESCE(source_repo,''), COALESCE(close_reason,''),
+			COALESCE(event_kind,''), COALESCE(actor,''), COALESCE(target,''), COALESCE(payload,''),
+			COALESCE(await_type,''), COALESCE(await_id,''), COALESCE(timeout_ns,0), COALESCE(waiters,''),
+			COALESCE(hook_bead,''), COALESCE(role_bead,''), COALESCE(agent_state,''),
+			COALESCE(last_activity,''), COALESCE(role_type,''), COALESCE(rig,''),
+			COALESCE(due_at,''), COALESCE(defer_until,'')
+		FROM issues`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query issues: %w", err)
+	}
+	defer issueRows.Close()
+
+	var issues []*types.Issue
+	for issueRows.Next() {
+		var issue types.Issue
+		var estMin sql.NullInt64
+		var extRef, compactCommit sql.NullString
+		var qualScore sql.NullFloat64
+		var timeoutNs int64
+		var waitersJSON string
+		var closedAt, compactedAt, lastActivity, dueAt, deferUntil sql.NullString
+		if err := issueRows.Scan(
+			&issue.ID, &issue.ContentHash, &issue.Title, &issue.Description,
+			&issue.Design, &issue.AcceptanceCriteria, &issue.Notes,
+			&issue.Status, &issue.Priority, &issue.IssueType,
+			&issue.Assignee, &estMin,
+			&issue.CreatedAt, &issue.CreatedBy, &issue.Owner,
+			&issue.UpdatedAt, &closedAt, &extRef,
+			&issue.CompactionLevel, &compactedAt, &compactCommit,
+			&issue.OriginalSize,
+			&issue.Sender, &issue.Ephemeral, &issue.Pinned,
+			&issue.IsTemplate, &issue.Crystallizes,
+			&issue.MolType, &issue.WorkType, &qualScore,
+			&issue.SourceSystem, &issue.SourceRepo, &issue.CloseReason,
+			&issue.EventKind, &issue.Actor, &issue.Target, &issue.Payload,
+			&issue.AwaitType, &issue.AwaitID, &timeoutNs, &waitersJSON,
+			&issue.HookBead, &issue.RoleBead, &issue.AgentState,
+			&lastActivity, &issue.RoleType, &issue.Rig,
+			&dueAt, &deferUntil,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan issue: %w", err)
+		}
+		if estMin.Valid {
+			v := int(estMin.Int64)
+			issue.EstimatedMinutes = &v
+		}
+		if extRef.Valid {
+			issue.ExternalRef = &extRef.String
+		}
+		if compactCommit.Valid {
+			issue.CompactedAtCommit = &compactCommit.String
+		}
+		if qualScore.Valid {
+			v := float32(qualScore.Float64)
+			issue.QualityScore = &v
+		}
+		issue.ClosedAt = parseNullTime(closedAt.String)
+		issue.CompactedAt = parseNullTime(compactedAt.String)
+		issue.LastActivity = parseNullTime(lastActivity.String)
+		issue.DueAt = parseNullTime(dueAt.String)
+		issue.DeferUntil = parseNullTime(deferUntil.String)
+		issue.Timeout = time.Duration(timeoutNs)
+		if waitersJSON != "" {
+			_ = json.Unmarshal([]byte(waitersJSON), &issue.Waiters)
+		}
+		issues = append(issues, &issue)
+	}
+
+	// Get labels
+	labelsMap := make(map[string][]string)
+	labelRows, err := db.QueryContext(ctx, "SELECT issue_id, label FROM labels")
+	if err == nil {
+		defer labelRows.Close()
+		for labelRows.Next() {
+			var issueID, label string
+			if err := labelRows.Scan(&issueID, &label); err == nil {
+				labelsMap[issueID] = append(labelsMap[issueID], label)
+			}
+		}
+	}
+
+	// Get dependencies
+	depsMap := make(map[string][]*types.Dependency)
+	depRows, err := db.QueryContext(ctx, "SELECT issue_id, depends_on_id, COALESCE(type,''), COALESCE(created_by,''), COALESCE(created_at,'') FROM dependencies")
+	if err == nil {
+		defer depRows.Close()
+		for depRows.Next() {
+			var dep types.Dependency
+			if err := depRows.Scan(&dep.IssueID, &dep.DependsOnID, &dep.Type, &dep.CreatedBy, &dep.CreatedAt); err == nil {
+				depsMap[dep.IssueID] = append(depsMap[dep.IssueID], &dep)
+			}
+		}
+	}
+
+	// Get events
+	eventsMap := make(map[string][]*types.Event)
+	eventRows, err := db.QueryContext(ctx, "SELECT issue_id, COALESCE(event_type,''), COALESCE(actor,''), old_value, new_value, comment, COALESCE(created_at,'') FROM events")
+	if err == nil {
+		defer eventRows.Close()
+		for eventRows.Next() {
+			var issueID string
+			var event types.Event
+			var oldVal, newVal, comment sql.NullString
+			if err := eventRows.Scan(&issueID, &event.EventType, &event.Actor, &oldVal, &newVal, &comment, &event.CreatedAt); err == nil {
+				if oldVal.Valid {
+					event.OldValue = &oldVal.String
+				}
+				if newVal.Valid {
+					event.NewValue = &newVal.String
+				}
+				if comment.Valid {
+					event.Comment = &comment.String
+				}
+				eventsMap[issueID] = append(eventsMap[issueID], &event)
+			}
+		}
+	}
+
+	// Assign labels and dependencies to issues
+	for _, issue := range issues {
+		if labels, ok := labelsMap[issue.ID]; ok {
+			issue.Labels = labels
+		}
+		if deps, ok := depsMap[issue.ID]; ok {
+			issue.Dependencies = deps
+		}
+	}
+
+	return &migrationData{
+		issues:     issues,
+		labelsMap:  labelsMap,
+		depsMap:    depsMap,
+		eventsMap:  eventsMap,
+		config:     config,
+		prefix:     prefix,
+		issueCount: len(issues),
+	}, nil
+}
+
+// Helper functions for output (CGO build only — used by handleToDoltMigration)
+
+func exitWithError(code, message, hint string) {
+	if jsonOutput {
+		outputJSON(map[string]interface{}{
+			"error":   code,
+			"message": message,
+		})
+	} else {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", message)
+		if hint != "" {
+			fmt.Fprintf(os.Stderr, "Hint: %s\n", hint)
+		}
+	}
+	os.Exit(1)
+}
+
+func printNoop(message string) {
+	if jsonOutput {
+		outputJSON(map[string]interface{}{
+			"status":  "noop",
+			"message": message,
+		})
+	} else {
+		fmt.Printf("%s\n", ui.RenderPass("✓ "+message))
+		fmt.Println("No migration needed")
+	}
+}
+
+func printSuccess(message string) {
+	if !jsonOutput {
+		fmt.Printf("%s\n", ui.RenderPass("✓ "+message))
+	}
+}
+
+func printWarning(message string) {
+	if !jsonOutput {
+		fmt.Printf("%s\n", ui.RenderWarn("Warning: "+message))
+	}
+}
+
+func printProgress(message string) {
+	if !jsonOutput {
+		fmt.Printf("%s\n", message)
+	}
+}
+
+func printMigrationPlan(title, source, target string, data *migrationData) {
+	if jsonOutput {
+		return
+	}
+	fmt.Printf("%s Migration\n", title)
+	fmt.Printf("%s\n\n", strings.Repeat("=", len(title)+10))
+	fmt.Printf("Source: %s\n", source)
+	fmt.Printf("Target: %s\n", target)
+	fmt.Printf("Issues to migrate: %d\n", data.issueCount)
+
+	eventCount := 0
+	for _, events := range data.eventsMap {
+		eventCount += len(events)
+	}
+	fmt.Printf("Events to migrate: %d\n", eventCount)
+	fmt.Printf("Config keys: %d\n", len(data.config))
+
+	if data.prefix != "" {
+		fmt.Printf("Issue prefix: %s\n", data.prefix)
+	}
+	fmt.Println()
+}
+
+func printDryRun(source, target string, data *migrationData, withBackup bool) {
+	eventCount := 0
+	for _, events := range data.eventsMap {
+		eventCount += len(events)
+	}
+
+	if jsonOutput {
+		result := map[string]interface{}{
+			"dry_run":      true,
+			"source":       source,
+			"target":       target,
+			"issue_count":  data.issueCount,
+			"event_count":  eventCount,
+			"config_keys":  len(data.config),
+			"prefix":       data.prefix,
+			"would_backup": withBackup,
+		}
+		outputJSON(result)
+	} else {
+		fmt.Println("Dry run mode - no changes will be made")
+		fmt.Println("Would perform:")
+		step := 1
+		if withBackup {
+			fmt.Printf("  %d. Create backup of source database\n", step)
+			step++
+		}
+		fmt.Printf("  %d. Create target database at %s\n", step, target)
+		step++
+		fmt.Printf("  %d. Import %d issues with labels and dependencies\n", step, data.issueCount)
+		step++
+		fmt.Printf("  %d. Import %d events (history/comments)\n", step, eventCount)
+		step++
+		fmt.Printf("  %d. Copy %d config values\n", step, len(data.config))
+		step++
+		fmt.Printf("  %d. Update metadata.json\n", step)
+	}
+}
+
+func confirmBackendMigration(from, to string, withBackup bool) bool {
+	fmt.Printf("This will:\n")
+	step := 1
+	if withBackup {
+		fmt.Printf("  %d. Create a backup of your %s database\n", step, from)
+		step++
+	}
+	fmt.Printf("  %d. Create a %s database and import all data\n", step, to)
+	step++
+	fmt.Printf("  %d. Update metadata.json to use %s backend\n", step, to)
+	step++
+	fmt.Printf("  %d. Keep your %s database (can be deleted after verification)\n\n", step, from)
+	fmt.Printf("Continue? [y/N] ")
+	var response string
+	_, _ = fmt.Scanln(&response)
+	return strings.ToLower(response) == "y" || strings.ToLower(response) == "yes"
+}
+
+func printFinalStatus(backend string, imported, skipped int, backupPath, newPath, oldPath string, toDolt bool) {
+	if jsonOutput {
+		result := map[string]interface{}{
+			"status":          "success",
+			"backend":         backend,
+			"issues_imported": imported,
+			"issues_skipped":  skipped,
+		}
+		if backupPath != "" {
+			result["backup_path"] = backupPath
+		}
+		if toDolt {
+			result["dolt_path"] = newPath
+		} else {
+			result["sqlite_path"] = newPath
+		}
+		outputJSON(result)
+	} else {
+		fmt.Println()
+		fmt.Printf("%s\n", ui.RenderPass("✓ Migration complete!"))
+		fmt.Println()
+		fmt.Printf("Your beads now use %s storage.\n", strings.ToUpper(backend))
+		if backupPath != "" {
+			fmt.Printf("Backup: %s\n", backupPath)
+		}
+		fmt.Println()
+		fmt.Println("Next steps:")
+		fmt.Println("  - Verify data: bd list")
+		fmt.Println("  - After verification, you can delete the old database:")
+		fmt.Printf("    rm %s\n", oldPath)
+	}
+}
+
+// listMigrations returns registered Dolt migrations (CGO build).
+func listMigrations() []string {
+	return dolt.ListMigrations()
+}

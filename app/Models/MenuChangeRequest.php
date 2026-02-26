@@ -2,33 +2,44 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
 class MenuChangeRequest extends Model
 {
+    use HasFactory;
+
     protected $fillable = [
-        'restaurant_id', 'menu_item_id', 'action_type', 
-        'proposed_data', 'old_data', 'status', 'admin_id', 
-        'requested_by', 'rejection_reason', 'reviewed_at'
+        'store_id', 'product_id', 'action_type', 'proposed_data',
+        'old_data', 'requested_by', 'status', 'admin_id',
+        'reviewed_at', 'rejection_reason',
     ];
 
     protected $casts = [
         'proposed_data' => 'array',
+        'old_data'      => 'array',
         'reviewed_at'   => 'datetime',
     ];
 
+    public function store()
+    {
+        return $this->belongsTo(Store::class);
+    }
+
+    // Backward compat alias
     public function restaurant()
     {
-        return $this->belongsTo(Restaurant::class);
+        return $this->store();
     }
 
+    public function product()
+    {
+        return $this->belongsTo(Product::class);
+    }
+
+    // Backward compat alias
     public function menuItem()
     {
-        return $this->belongsTo(MenuItem::class);
-    }
-
-    public function admin()
-    {
-        return $this->belongsTo(User::class, 'admin_id');
+        return $this->product();
     }
 }

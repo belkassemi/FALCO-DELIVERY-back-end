@@ -11,8 +11,8 @@ use App\Http\Controllers\Api\OrderController;
 use App\Http\Controllers\Api\PaymentController;
 use App\Http\Controllers\Api\ProfileController;
 use App\Http\Controllers\Api\PromotionController;
-use App\Http\Controllers\Api\RestaurantController;
-use App\Http\Controllers\Api\RestaurantDashboardController;
+use App\Http\Controllers\Api\StoreController;
+use App\Http\Controllers\Api\StoreDashboardController;
 use App\Http\Controllers\Api\ReviewController;
 use App\Http\Controllers\Api\SocketController;
 use App\Http\Controllers\Api\WalletController;
@@ -23,17 +23,21 @@ use Illuminate\Support\Facades\Route;
 // PUBLIC AUTH ROUTES
 // ============================================================
 Route::group(['prefix' => 'auth'], function () {
-    Route::post('register',             [AuthController::class, 'register']);
-    Route::post('register-restaurant',  [AuthController::class, 'registerRestaurant']);
+    // Phone-first OTP auth (customers — PRD lazy signup)
+    Route::post('request-otp',          [AuthController::class, 'requestOtp']);
+    Route::post('verify-otp',           [AuthController::class, 'verifyOtp']);
+
+    // Traditional auth (store owners, admins)
+    Route::post('register-store',       [AuthController::class, 'registerStore']);
     Route::post('login',                [AuthController::class, 'login']);
     Route::post('refresh',              [AuthController::class, 'refresh']);
-    Route::post('forgot-password',      [AuthController::class, 'forgotPassword']);
-    Route::post('reset-password',       [AuthController::class, 'resetPassword']);
-    Route::post('verify-email',         [AuthController::class, 'verifyEmail']);
 });
 
-// PAYMENT WEBHOOK — must be public (no JWT) so the gateway can call it
+// PAYMENT WEBHOOK — public (no JWT)
 Route::post('payment/webhook', [PaymentController::class, 'webhook']);
+
+// PUBLIC: List categories (for anonymous browsing)
+Route::get('categories', [StoreController::class, 'categories']);
 
 // ============================================================
 // PROTECTED ROUTES (requires JWT)
@@ -41,32 +45,31 @@ Route::post('payment/webhook', [PaymentController::class, 'webhook']);
 Route::group(['middleware' => 'auth:api'], function () {
 
     // --- Auth / Profile ---
-    Route::post('auth/logout',                  [AuthController::class, 'logout']);
-    Route::post('auth/resend-verification',     [AuthController::class, 'resendVerification']);
-    Route::post('auth/change-password',         [AuthController::class, 'changePassword']);
+    Route::post('auth/logout',              [AuthController::class, 'logout']);
+    Route::post('auth/change-password',     [AuthController::class, 'changePassword']);
 
-    Route::get('profile',                       [AuthController::class, 'profile']);
-    Route::put('profile',                       [ProfileController::class, 'update']);
-    Route::post('profile/upload-avatar',        [ProfileController::class, 'uploadAvatar']);
-    Route::get('profile/addresses',             [ProfileController::class, 'getAddresses']);
-    Route::post('profile/addresses',            [ProfileController::class, 'addAddress']);
-    Route::delete('profile/addresses/{id}',     [ProfileController::class, 'deleteAddress']);
+    Route::get('profile',                   [AuthController::class, 'profile']);
+    Route::put('profile',                   [ProfileController::class, 'update']);
+    Route::post('profile/upload-avatar',    [ProfileController::class, 'uploadAvatar']);
+    Route::get('profile/addresses',         [ProfileController::class, 'getAddresses']);
+    Route::post('profile/addresses',        [ProfileController::class, 'addAddress']);
+    Route::delete('profile/addresses/{id}', [ProfileController::class, 'deleteAddress']);
 
-    // Profile Favorites (explicit POST/DELETE instead of toggle)
+    // Profile Favorites
     Route::get('profile/favorites',                     [ProfileController::class, 'getFavorites']);
-    Route::post('profile/favorites/{restaurantId}',     [ProfileController::class, 'addFavorite']);
-    Route::delete('profile/favorites/{restaurantId}',   [ProfileController::class, 'removeFavorite']);
+    Route::post('profile/favorites/{storeId}',          [ProfileController::class, 'addFavorite']);
+    Route::delete('profile/favorites/{storeId}',        [ProfileController::class, 'removeFavorite']);
 
-    // --- Public Restaurants (any authenticated user) ---
-    Route::get('restaurants',                   [RestaurantController::class, 'index']);
-    Route::get('restaurants/nearby',            [RestaurantController::class, 'nearby']);
-    Route::get('restaurants/{id}',              [RestaurantController::class, 'show']);
-    Route::get('restaurants/{id}/reviews',      [RestaurantController::class, 'reviews']);
+    // --- Public Stores (any authenticated user) ---
+    Route::get('stores',                    [StoreController::class, 'index']);
+    Route::get('stores/nearby',             [StoreController::class, 'nearby']);
+    Route::get('stores/{id}',               [StoreController::class, 'show']);
+    Route::get('stores/{id}/reviews',       [StoreController::class, 'reviews']);
 
-    // --- Reviews (customer own CRUD) ---
-    Route::post('restaurants/{id}/reviews',     [ReviewController::class, 'store']);
-    Route::put('reviews/{id}',                  [ReviewController::class, 'update']);
-    Route::delete('reviews/{id}',               [ReviewController::class, 'destroy']);
+    // --- Reviews ---
+    Route::post('stores/{id}/reviews',      [ReviewController::class, 'store']);
+    Route::put('reviews/{id}',              [ReviewController::class, 'update']);
+    Route::delete('reviews/{id}',           [ReviewController::class, 'destroy']);
 
     // --- Socket Token ---
     Route::post('socket/token', [SocketController::class, 'generateToken']);
@@ -77,12 +80,12 @@ Route::group(['middleware' => 'auth:api'], function () {
     Route::group(['middleware' => RoleMiddleware::class . ':customer'], function () {
         Route::get('orders',                            [OrderController::class, 'history']);
         Route::post('orders',                           [OrderController::class, 'store']);
-        Route::post('orders/pharmacy',                  [OrderController::class, 'store']);
         Route::get('orders/{id}',                       [OrderController::class, 'show']);
         Route::patch('orders/{id}/cancel',              [OrderController::class, 'cancel']);
         Route::get('orders/{id}/tracking',              [OrderController::class, 'track']);
         Route::post('orders/{id}/confirm-delivery',     [OrderController::class, 'confirmDelivery']);
         Route::post('orders/{id}/report-issue',         [OrderController::class, 'reportIssue']);
+        Route::post('orders/{id}/reorder',              [OrderController::class, 'reorder']);
     });
 
     // ============================================================
@@ -101,29 +104,40 @@ Route::group(['middleware' => 'auth:api'], function () {
             Route::post('orders/{id}/pickup',           [CourierController::class, 'pickupOrder']);
             Route::post('orders/{id}/deliver',          [CourierController::class, 'deliverOrder']);
             Route::get('earnings',                      [CourierController::class, 'earnings']);
-            Route::post('withdraw-request',             [CourierController::class, 'withdrawRequest']);
-            Route::get('withdraw-history',              [CourierController::class, 'withdrawHistory']);
         });
     });
 
     // ============================================================
-    // RESTAURANT DASHBOARD (owner)
+    // STORE DASHBOARD (owner)
     // ============================================================
-    Route::group(['prefix' => 'restaurant', 'middleware' => RoleMiddleware::class . ':restaurant_owner'], function () {
-        Route::get('dashboard',                         [RestaurantDashboardController::class, 'index']);
-        Route::put('profile',                           [RestaurantDashboardController::class, 'updateProfile']);
-        Route::post('upload-image',                     [RestaurantDashboardController::class, 'uploadImage']);
-        Route::put('status',                            [RestaurantDashboardController::class, 'updateStatus']);
-        Route::get('menu',                              [RestaurantDashboardController::class, 'getMenu']);
-        Route::post('menu',                             [RestaurantDashboardController::class, 'addMenuItem']);
-        Route::put('menu/{id}',                         [RestaurantDashboardController::class, 'updateMenuItem']);
-        Route::delete('menu/{id}',                      [RestaurantDashboardController::class, 'deleteMenuItem']);
-        Route::get('orders',                            [RestaurantDashboardController::class, 'getOrders']);
-        Route::get('orders/history',                    [RestaurantDashboardController::class, 'orderHistory']);
-        Route::put('orders/{id}/accept',                [RestaurantDashboardController::class, 'acceptOrder']);
-        Route::put('orders/{id}/ready',                 [RestaurantDashboardController::class, 'orderReady']);
-        Route::put('orders/{id}/reject',                [RestaurantDashboardController::class, 'rejectOrder']);
-        Route::get('analytics',                         [RestaurantDashboardController::class, 'analytics']);
+    Route::group(['prefix' => 'store', 'middleware' => RoleMiddleware::class . ':restaurant_owner'], function () {
+        Route::get('dashboard',                         [StoreDashboardController::class, 'index']);
+        Route::put('profile',                           [StoreDashboardController::class, 'updateProfile']);
+        Route::post('upload-image',                     [StoreDashboardController::class, 'uploadImage']);
+
+        // Store Hours & Closures (PRD §7.1)
+        Route::get('hours',                             [StoreDashboardController::class, 'getHours']);
+        Route::put('hours',                             [StoreDashboardController::class, 'setHours']);
+        Route::post('closures',                         [StoreDashboardController::class, 'addClosure']);
+        Route::delete('closures/{id}',                  [StoreDashboardController::class, 'removeClosure']);
+
+        // Menu (products) — admin-approval workflow (PRD §7.2)
+        Route::get('menu',                              [StoreDashboardController::class, 'getMenu']);
+        Route::post('menu',                             [StoreDashboardController::class, 'addProduct']);
+        Route::put('menu/{id}',                         [StoreDashboardController::class, 'updateProduct']);
+        Route::delete('menu/{id}',                      [StoreDashboardController::class, 'deleteProduct']);
+
+        // Orders
+        Route::get('orders',                            [StoreDashboardController::class, 'getOrders']);
+        Route::get('orders/history',                    [StoreDashboardController::class, 'orderHistory']);
+        Route::put('orders/{id}/accept',                [StoreDashboardController::class, 'acceptOrder']);
+        Route::put('orders/{id}/ready',                 [StoreDashboardController::class, 'orderReady']);
+        Route::put('orders/{id}/reject',                [StoreDashboardController::class, 'rejectOrder']);
+
+        // Analytics (PRD §7.3)
+        Route::get('analytics/revenue',                 [StoreDashboardController::class, 'revenueAnalytics']);
+        Route::get('analytics/top-products',            [StoreDashboardController::class, 'topProducts']);
+        Route::get('analytics/volume',                  [StoreDashboardController::class, 'volumeAnalytics']);
     });
 
     // ============================================================
@@ -140,12 +154,13 @@ Route::group(['middleware' => 'auth:api'], function () {
         Route::post('couriers',                         [AdminController::class, 'createCourier']);
         Route::get('couriers',                          [AdminController::class, 'couriers']);
         Route::patch('couriers/{id}/status',            [AdminController::class, 'updateCourierStatus']);
+        Route::get('couriers/{id}/monthly-stats',       [AdminController::class, 'courierMonthlyStats']);
 
-        // Restaurants
-        Route::get('restaurants',                       [AdminController::class, 'restaurants']);
-        Route::get('restaurants/pending',               [AdminController::class, 'pendingRestaurants']);
-        Route::post('restaurants/{id}/approve',         [AdminController::class, 'approveRestaurant']);
-        Route::patch('restaurants/{id}/status',         [AdminController::class, 'updateRestaurantStatus']);
+        // Stores
+        Route::get('stores',                            [AdminController::class, 'stores']);
+        Route::get('stores/pending',                    [AdminController::class, 'pendingStores']);
+        Route::post('stores/{id}/approve',              [AdminController::class, 'approveStore']);
+        Route::patch('stores/{id}/status',              [AdminController::class, 'updateStoreStatus']);
 
         // Orders
         Route::get('orders',                            [AdminController::class, 'orders']);
@@ -159,6 +174,15 @@ Route::group(['middleware' => 'auth:api'], function () {
         Route::get('menu-changes',                      [AdminController::class, 'pendingMenuChanges']);
         Route::post('menu-changes/{id}/approve',        [AdminController::class, 'approveMenuChange']);
         Route::post('menu-changes/{id}/reject',         [AdminController::class, 'rejectMenuChange']);
+
+        // Categories
+        Route::get('categories',                        [AdminController::class, 'categoriesList']);
+        Route::post('categories',                       [AdminController::class, 'createCategory']);
+        Route::put('categories/{id}',                   [AdminController::class, 'updateCategory']);
+
+        // Settings
+        Route::get('settings',                          [AdminController::class, 'settings']);
+        Route::put('settings',                          [AdminController::class, 'updateSetting']);
 
         // Promotions CRUD
         Route::post('promotions',                       [AdminPromotionController::class, 'store']);
@@ -183,7 +207,7 @@ Route::group(['middleware' => 'auth:api'], function () {
     });
 
     // ============================================================
-    // WALLET
+    // WALLET (customer only — PRD: no wallet for couriers)
     // ============================================================
     Route::get('wallet',                [WalletController::class, 'show']);
     Route::post('wallet/top-up',        [WalletController::class, 'topUp']);
@@ -210,5 +234,4 @@ Route::group(['middleware' => 'auth:api'], function () {
     Route::put('notifications/{id}/read',           [NotificationController::class, 'markRead']);
     Route::post('notifications/device-token',       [NotificationController::class, 'registerDeviceToken']);
     Route::post('notifications/mark-all-read',      [NotificationController::class, 'markAllRead']);
-
 });

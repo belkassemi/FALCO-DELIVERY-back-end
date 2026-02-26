@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Order;
 use App\Models\CourierLocation;
+use App\Models\CourierEarning;
 use App\Models\OrderDispatchLog;
 use App\Events\OrderAssignedEvent;
 use App\Events\OrderLocationUpdateEvent;
@@ -16,28 +17,23 @@ class CourierController extends Controller
     public function history()
     {
         $orders = auth('api')->user()->courierOrders()
-            ->with('restaurant', 'customer')
+            ->with('store', 'customer')
             ->latest()
             ->paginate(15);
-            
+
         return response()->json($orders);
     }
-    /**
-     * Update courier online status.
-     */
+
     public function updateStatus(Request $request)
     {
         $request->validate(['online' => 'required|boolean']);
-        
+
         $location = auth('api')->user()->courierLocation;
         $location->update(['is_online' => $request->online]);
 
         return response()->json(['message' => 'Status updated', 'is_online' => $request->online]);
     }
 
-    /**
-     * Update real-time coordinates.
-     */
     public function updateLocation(Request $request)
     {
         $request->validate([
@@ -46,8 +42,7 @@ class CourierController extends Controller
         ]);
 
         $courier = auth('api')->user();
-        $location = $courier->courierLocation;
-        // TECHNICAL CONSTRAINT: Must use ST_SetSRID and ST_MakePoint for geography POINT
+
         DB::statement(
             "UPDATE courier_locations SET location = ST_SetSRID(ST_MakePoint(?, ?), 4326)::geography, updated_at = NOW() WHERE courier_id = ?",
             [$request->lng, $request->lat, $courier->id]
@@ -68,13 +63,11 @@ class CourierController extends Controller
     public function acceptOrder($id)
     {
         return DB::transaction(function () use ($id) {
-            // Atomic lock: first courier wins, all others get 409
             $order = Order::lockForUpdate()->findOrFail($id);
 
             if ($order->status !== 'pending') {
                 return response()->json(['error' => 'Order cannot be accepted because it is no longer pending.'], 400);
             }
-
             if ($order->courier_id !== null) {
                 return response()->json(['error' => 'Order already accepted by another courier.'], 409);
             }
@@ -108,6 +101,15 @@ class CourierController extends Controller
     {
         $order = Order::findOrFail($id);
         $order->update(['status' => 'delivered', 'payment_status' => 'paid']);
+
+        // Record courier earnings (PRD §8.3 — cash-based, for visibility)
+        CourierEarning::create([
+            'courier_id' => auth('api')->id(),
+            'order_id'   => $order->id,
+            'amount'     => $order->delivery_fee,
+            'type'       => 'delivery',
+        ]);
+
         return response()->json(['message' => 'Order delivered', 'status' => 'delivered']);
     }
 
@@ -126,38 +128,28 @@ class CourierController extends Controller
     {
         $orders = Order::where('status', 'pending')
             ->whereNull('courier_id')
-            ->with('restaurant', 'customer')
+            ->with('store', 'customer')
             ->latest()
             ->get();
 
         return response()->json($orders);
     }
 
-    public function withdrawRequest(Request $request)
+    /**
+     * Courier earnings visibility (PRD §8.3 — no wallet, cash-based).
+     */
+    public function earnings()
     {
-        $request->validate(['amount' => 'required|numeric|min:1']);
-
-        $courier  = auth('api')->user();
-        $earnings = $courier->courierOrders()->where('status', 'delivered')->sum('delivery_fee');
-
-        if ($request->amount > $earnings) {
-            return response()->json(['error' => 'Requested amount exceeds your available earnings.'], 400);
-        }
-
-        $withdraw = \App\Models\WithdrawalRequest::create([
-            'courier_id' => $courier->id,
-            'amount'     => $request->amount,
-        ]);
-
-        return response()->json(['message' => 'Withdrawal request submitted.', 'request_id' => $withdraw->id], 201);
-    }
-
-    public function withdrawHistory()
-    {
-        $history = \App\Models\WithdrawalRequest::where('courier_id', auth('api')->id())
+        $courier = auth('api')->user();
+        $earnings = CourierEarning::where('courier_id', $courier->id)
             ->latest()
-            ->get();
+            ->paginate(20);
 
-        return response()->json($history);
+        $totalEarnings = CourierEarning::where('courier_id', $courier->id)->sum('amount');
+
+        return response()->json([
+            'total_earnings' => $totalEarnings,
+            'history'        => $earnings,
+        ]);
     }
 }

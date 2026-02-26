@@ -12,14 +12,22 @@ class User extends Authenticatable implements JWTSubject
     use HasFactory, Notifiable;
 
     protected $fillable = [
-        'name', 'email', 'phone', 'password', 'avatar', 'role', 'status', 'phone_verified_at',
-        'activation_code', 'activation_expires_at', 'activation_attempts', 'is_activated', 'activation_locked_at'
+        'name', 'email', 'phone', 'password', 'avatar', 'role', 'status',
+        'phone_verified_at', 'device_token',
+        'activation_code', 'activation_expires_at', 'activation_attempts',
+        'is_activated', 'activation_locked_at',
+        'password_reset_token', 'password_reset_expires_at',
     ];
 
-    protected $hidden = ['password', 'remember_token'];
+    protected $hidden = ['password', 'remember_token', 'activation_code'];
 
     protected $casts = [
-        'email_verified_at' => 'datetime',
+        'email_verified_at'         => 'datetime',
+        'phone_verified_at'         => 'datetime',
+        'activation_expires_at'     => 'datetime',
+        'activation_locked_at'      => 'datetime',
+        'password_reset_expires_at' => 'datetime',
+        'is_activated'              => 'boolean',
     ];
 
     // JWT
@@ -34,9 +42,15 @@ class User extends Authenticatable implements JWTSubject
     }
 
     // Relationships
+    public function store()
+    {
+        return $this->hasOne(Store::class);
+    }
+
+    // Keep 'restaurant()' as alias for backward compat during transition
     public function restaurant()
     {
-        return $this->hasOne(Restaurant::class);
+        return $this->store();
     }
 
     public function orders()
@@ -56,7 +70,7 @@ class User extends Authenticatable implements JWTSubject
 
     public function favorites()
     {
-        return $this->belongsToMany(Restaurant::class, 'favorites');
+        return $this->belongsToMany(Store::class, 'favorites', 'user_id', 'store_id');
     }
 
     public function wallet()
@@ -72,5 +86,15 @@ class User extends Authenticatable implements JWTSubject
     public function notifications()
     {
         return $this->hasMany(AppNotification::class);
+    }
+
+    public function courierEarnings()
+    {
+        return $this->hasMany(CourierEarning::class, 'courier_id');
+    }
+
+    public function tosAcceptances()
+    {
+        return $this->hasMany(TosAcceptance::class);
     }
 }

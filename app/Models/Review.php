@@ -9,7 +9,7 @@ class Review extends Model
 {
     use SoftDeletes;
 
-    protected $fillable = ['order_id', 'user_id', 'restaurant_id', 'rating', 'comment'];
+    protected $fillable = ['order_id', 'user_id', 'store_id', 'rating', 'comment'];
 
     protected $casts = ['created_at' => 'datetime'];
 
@@ -23,8 +23,14 @@ class Review extends Model
         return $this->belongsTo(User::class, 'customer_id');
     }
 
+    public function store()
+    {
+        return $this->belongsTo(Store::class);
+    }
+
+    // Backward compat alias
     public function restaurant()
     {
-        return $this->belongsTo(Restaurant::class);
+        return $this->store();
     }
 }
