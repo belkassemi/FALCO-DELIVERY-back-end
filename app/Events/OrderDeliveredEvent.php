@@ -25,7 +25,7 @@ class OrderDeliveredEvent implements ShouldBroadcast
         return [
             new PrivateChannel('order.' . $this->order->id),
             new PrivateChannel('user.' . $this->order->customer_id),
-            new PrivateChannel('restaurant.' . $this->order->restaurant_id),
+            new PrivateChannel('store.' . $this->order->store_id),
         ];
     }
 

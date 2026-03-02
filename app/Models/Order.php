@@ -13,7 +13,8 @@ class Order extends Model
         'customer_id', 'store_id', 'courier_id', 'address_id',
         'status', 'total_price', 'delivery_fee', 'delivery_distance_km',
         'estimated_time', 'cancel_reason', 'payment_method', 'payment_status',
-        'notes', 'age_confirmation', 'age_confirmation_at',
+        'notes', 'age_confirmation', 'age_confirmation_at', 'promo_code_id',
+        'customer_note', 'store_note', 'courier_note',
     ];
 
     protected $casts = [
@@ -24,13 +25,18 @@ class Order extends Model
         'age_confirmation_at'  => 'datetime',
     ];
 
-    const STATUS_PENDING    = 'pending';
-    const STATUS_ASSIGNED   = 'assigned';
-    const STATUS_PREPARING  = 'preparing';
-    const STATUS_ON_THE_WAY = 'on_the_way';
-    const STATUS_DELIVERED  = 'delivered';
-    const STATUS_CANCELLED  = 'cancelled';
-    const STATUS_REJECTED   = 'rejected';
+    const STATUS_PENDING           = 'pending';
+    const STATUS_STORE_NOTIFIED    = 'store_notified';
+    const STATUS_STORE_CONFIRMED   = 'store_confirmed';
+    const STATUS_COURIER_SEARCHING = 'courier_searching';
+    const STATUS_COURIER_ASSIGNED  = 'courier_assigned';
+    const STATUS_PREPARING         = 'preparing';
+    const STATUS_READY             = 'ready';
+    const STATUS_PICKED_UP         = 'picked_up';
+    const STATUS_DELIVERED         = 'delivered';
+    const STATUS_CANCELLED         = 'cancelled';
+    const STATUS_REJECTED          = 'rejected';
+    const STATUS_NO_COURIER_FOUND  = 'no_courier_found';
 
     public function customer()
     {
@@ -73,6 +79,21 @@ class Order extends Model
         return $this->hasOne(Review::class);
     }
 
+    public function promoCode()
+    {
+        return $this->belongsTo(Promotion::class, 'promo_code_id');
+    }
+
+    public function assignmentAttempts()
+    {
+        return $this->hasMany(OrderDispatchLog::class);
+    }
+
+    public function report()
+    {
+        return $this->hasOne(OrderReport::class);
+    }
+
     public function isPending(): bool
     {
         return $this->status === self::STATUS_PENDING;
@@ -80,7 +101,10 @@ class Order extends Model
 
     public function canBeCancelled(): bool
     {
-        return $this->status === self::STATUS_PENDING;
+        return in_array($this->status, [
+            self::STATUS_PENDING,
+            self::STATUS_STORE_NOTIFIED,
+        ]);
     }
 
     public function hasAgeRestrictedItems(): bool

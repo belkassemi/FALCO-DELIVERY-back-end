@@ -28,7 +28,7 @@ final readonly class UpdateLocationController
         );
 
         $activeOrders = Order::where('courier_id', $courier->id)
-            ->whereIn('status', ['assigned', 'preparing', 'on_the_way'])
+            ->whereIn('status', ['courier_assigned', 'preparing', 'ready', 'picked_up'])
             ->get();
 
         foreach ($activeOrders as $order) {

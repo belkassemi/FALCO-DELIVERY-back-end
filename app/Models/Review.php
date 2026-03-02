@@ -2,35 +2,42 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
 class Review extends Model
 {
-    use SoftDeletes;
+    use HasFactory, SoftDeletes;
 
-    protected $fillable = ['order_id', 'user_id', 'store_id', 'rating', 'comment'];
+    protected $fillable = [
+        'order_id',
+        'user_id',
+        'store_id',
+        'order_item_id',
+        'type',        // 'store' or 'product'
+        'rating',      // 1-5
+        'comment',
+    ];
 
-    protected $casts = ['created_at' => 'datetime'];
+    public function user(): BelongsTo
+    {
+        return $this->belongsTo(User::class);
+    }
 
-    public function order()
+    public function order(): BelongsTo
     {
         return $this->belongsTo(Order::class);
     }
 
-    public function customer()
-    {
-        return $this->belongsTo(User::class, 'customer_id');
-    }
-
-    public function store()
+    public function store(): BelongsTo
     {
         return $this->belongsTo(Store::class);
     }
 
-    // Backward compat alias
-    public function restaurant()
+    public function orderItem(): BelongsTo
     {
-        return $this->store();
+        return $this->belongsTo(OrderItem::class);
     }
 }

@@ -9,12 +9,28 @@ use App\Models\Store;
 use App\Models\MenuChangeRequest;
 use App\Models\StoreHour;
 use App\Models\StoreClosure;
+use App\Services\DispatchService;
+use App\Services\NotificationService;
+use App\Services\SmsService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\DB;
 
 class StoreDashboardController extends Controller
 {
+    protected DispatchService $dispatchService;
+    protected NotificationService $notificationService;
+    protected SmsService $smsService;
+
+    public function __construct(
+        DispatchService $dispatchService,
+        NotificationService $notificationService,
+        SmsService $smsService
+    ) {
+        $this->dispatchService     = $dispatchService;
+        $this->notificationService = $notificationService;
+        $this->smsService          = $smsService;
+    }
     /**
      * Get the authenticated user's store with products and analytics.
      */
@@ -224,28 +240,88 @@ class StoreDashboardController extends Controller
         return response()->json($store->orders()->with('items.product', 'customer')->latest()->get());
     }
 
+    /**
+     * PRD §5.7: Store accepts order after verification call.
+     * Transitions store_notified → store_confirmed → triggers courier dispatch.
+     */
     public function acceptOrder($id)
     {
         $order = Order::findOrFail($id);
         $this->authorize('restaurantAction', $order);
-        $order->update(['status' => 'preparing']);
-        return response()->json(['message' => 'Order accepted', 'status' => 'preparing']);
+
+        if ($order->status !== Order::STATUS_STORE_NOTIFIED) {
+            return response()->json(['error' => 'Order can only be accepted when in store_notified status.'], 400);
+        }
+
+        $order->update(['status' => Order::STATUS_STORE_CONFIRMED]);
+
+        // Notify customer that store confirmed
+        if ($order->customer) {
+            $this->notificationService->sendToCustomer(
+                $order->customer,
+                'Order Confirmed',
+                'Your order has been confirmed by the store. Looking for a courier...',
+                ['order_id' => $order->id, 'type' => 'store_confirmed']
+            );
+        }
+
+        // PRD §5.7: NOW start courier search
+        $order->update(['status' => Order::STATUS_COURIER_SEARCHING]);
+        $dispatched = $this->dispatchService->dispatchOrder($order);
+
+        if (!$dispatched) {
+            $order->update(['status' => Order::STATUS_NO_COURIER_FOUND]);
+            return response()->json([
+                'message' => 'Order confirmed but no couriers available.',
+                'status'  => Order::STATUS_NO_COURIER_FOUND,
+            ]);
+        }
+
+        return response()->json([
+            'message' => 'Order accepted. Courier search started.',
+            'status'  => Order::STATUS_COURIER_SEARCHING,
+        ]);
     }
 
     public function orderReady($id)
     {
         $order = Order::findOrFail($id);
         $this->authorize('restaurantAction', $order);
-        $order->update(['status' => 'on_the_way']);
-        return response()->json(['message' => 'Order marked as ready', 'status' => 'on_the_way']);
+        $order->update(['status' => Order::STATUS_READY]);
+        return response()->json(['message' => 'Order marked as ready for pickup', 'status' => 'ready']);
     }
 
+    /**
+     * PRD §5.7: Store rejects order after verification call.
+     * Notifies customer via FCM + SMS.
+     */
     public function rejectOrder($id)
     {
-        $order = Order::findOrFail($id);
+        $order = Order::with('customer')->findOrFail($id);
         $this->authorize('restaurantAction', $order);
-        $order->update(['status' => 'cancelled']);
-        return response()->json(['message' => 'Order rejected.', 'status' => 'cancelled']);
+
+        if (!in_array($order->status, [Order::STATUS_STORE_NOTIFIED, Order::STATUS_PENDING])) {
+            return response()->json(['error' => 'Order can only be rejected before courier dispatch.'], 400);
+        }
+
+        $order->update(['status' => Order::STATUS_REJECTED]);
+
+        // PRD §5.7: Notify customer via FCM + SMS
+        if ($order->customer) {
+            $this->notificationService->sendToCustomer(
+                $order->customer,
+                'Order Rejected',
+                'Unfortunately, the store has rejected your order.',
+                ['order_id' => $order->id, 'type' => 'order_rejected']
+            );
+
+            $this->smsService->sendOrderUpdate(
+                $order->customer->phone,
+                "[FALCO DELIVERY] لم يتم قبول طلبك من طرف المتجر. يرجى المحاولة مرة أخرى."
+            );
+        }
+
+        return response()->json(['message' => 'Order rejected. Customer notified.', 'status' => 'rejected']);
     }
 
     public function orderHistory()
@@ -256,6 +332,27 @@ class StoreDashboardController extends Controller
                 ->with('items.product', 'customer')
                 ->latest()->paginate(20)
         );
+    }
+
+    /**
+     * PUT /api/store/orders/{id}/note
+     * Store owner adds/updates store_note (visible to courier).
+     * Allowed while order is between preparing and ready.
+     */
+    public function updateOrderNote(Request $request, $id)
+    {
+        $request->validate(['note' => 'required|string|max:500']);
+
+        $store = auth('api')->user()->store;
+        $order = Order::where('store_id', $store->id)->findOrFail($id);
+
+        if (!in_array($order->status, ['courier_assigned', 'preparing', 'ready'])) {
+            return response()->json(['error' => 'Store note can only be set while the order is being prepared.'], 400);
+        }
+
+        $order->update(['store_note' => $request->note]);
+
+        return response()->json(['message' => 'Store note saved.', 'store_note' => $request->note]);
     }
 
     // --- Store Analytics (PRD §7.3) ---

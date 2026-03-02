@@ -118,24 +118,90 @@ class AdminController extends Controller
         return response()->json(Store::withCoordinates()->with('owner', 'categoryRelation')->get());
     }
 
-    public function pendingStores()
+    /**
+     * PRD §9.2: Admin creates store owner account.
+     * No self-registration exists for store owners.
+     */
+    public function createStoreOwner(Request $request)
     {
-        return response()->json(Store::withCoordinates()->where('is_approved', false)->get());
+        $request->validate([
+            'name'     => 'required|string|max:255',
+            'email'    => 'required|email|unique:users',
+            'password' => 'required|string|min:6',
+            'phone'    => 'required|string|unique:users',
+        ]);
+
+        $user = User::create([
+            'name'     => $request->name,
+            'email'    => $request->email,
+            'phone'    => $request->phone,
+            'password' => Hash::make($request->password),
+            'role'     => 'restaurant_owner',
+            'status'   => 'active',
+        ]);
+
+        return response()->json([
+            'message' => 'Store owner account created. Share credentials out-of-band.',
+            'user_id' => $user->id,
+            'email'   => $user->email,
+        ], 201);
     }
 
-    public function approveStore($id)
+    /**
+     * PRD §9.2: Admin creates the store and assigns to an existing owner.
+     * Stores are immediately live — no approval state.
+     */
+    public function createStore(Request $request)
     {
-        $store = Store::findOrFail($id);
-        $store->update(['is_approved' => true]);
-        return response()->json(['message' => 'Store approved']);
+        $request->validate([
+            'owner_id'    => 'required|exists:users,id',
+            'name'        => 'required|string|max:255',
+            'category_id' => 'required|exists:categories,id',
+            'address'     => 'nullable|string|max:255',
+            'lat'         => 'required|numeric',
+            'lng'         => 'required|numeric',
+            'phone'       => 'nullable|string',
+            'description' => 'nullable|string',
+        ]);
+
+        $owner = User::where('role', 'restaurant_owner')->findOrFail($request->owner_id);
+
+        $store = null;
+        DB::transaction(function () use ($request, $owner, &$store) {
+            $store = Store::create([
+                'user_id'     => $owner->id,
+                'category_id' => $request->category_id,
+                'name'        => $request->name,
+                'address'     => $request->address,
+                'phone'       => $request->phone,
+                'description' => $request->description,
+            ]);
+
+            // PRD §9.2: Stores are immediately live — set via raw DB since not in fillable
+            DB::statement(
+                "UPDATE stores SET is_approved = true, is_open = false, location = ST_SetSRID(ST_MakePoint(?, ?), 4326)::geography, updated_at = NOW() WHERE id = ?",
+                [$request->lng, $request->lat, $store->id]
+            );
+        });
+
+        return response()->json([
+            'message'  => 'Store created and is immediately live.',
+            'store_id' => $store->id,
+        ], 201);
     }
 
     public function updateStoreStatus(Request $request, $id)
     {
         $request->validate(['is_approved' => 'required|boolean']);
         $store = Store::findOrFail($id);
-        $store->update(['is_approved' => $request->is_approved]);
-        return response()->json(['message' => 'Store status updated.', 'is_approved' => $store->is_approved]);
+
+        // Use raw DB since is_approved is not in Store::$fillable
+        DB::table('stores')->where('id', $id)->update([
+            'is_approved' => $request->is_approved,
+            'updated_at'  => now(),
+        ]);
+
+        return response()->json(['message' => 'Store status updated.', 'is_approved' => $request->is_approved]);
     }
 
     // --- Orders ---
@@ -152,7 +218,10 @@ class AdminController extends Controller
 
     public function forceOrderStatus(Request $request, $id)
     {
-        $request->validate(['status' => 'required|in:pending,assigned,preparing,on_the_way,delivered,cancelled']);
+        $request->validate([
+            'status' => 'required|in:pending,store_notified,store_confirmed,courier_searching,courier_assigned,preparing,ready,picked_up,delivered,cancelled,rejected,no_courier_found',
+        ]);
+
         $order = Order::findOrFail($id);
         $order->update(['status' => $request->status]);
         return response()->json(['message' => 'Order status forced.', 'status' => $order->status]);
@@ -228,36 +297,48 @@ class AdminController extends Controller
         return response()->json(\App\Models\Refund::with('user', 'order')->latest()->paginate(20));
     }
 
-    public function approveRefund($id)
+    public function approveRefund(Request $request, $id)
     {
+        $request->validate([
+            'refund_method' => 'required|in:cash,bank_transfer',
+            'admin_note'    => 'nullable|string',
+        ]);
+
         $refund = \App\Models\Refund::findOrFail($id);
         if ($refund->status !== 'pending') {
             return response()->json(['error' => 'Refund already processed.'], 400);
         }
 
-        // PRD: No automated wallet credit. Admin handles refund offline.
+        // PRD §10.2: No automated money movement. Admin handles offline.
         $refund->update([
-            'status'      => 'approved',
-            'admin_id'    => auth('api')->id(),
-            'processed_at' => now(),
+            'status'        => 'approved',
+            'refund_method' => $request->refund_method,
+            'admin_id'      => auth('api')->id(),
+            'admin_note'    => $request->admin_note,
+            'processed_at'  => now(),
+            'resolved_at'   => now(),
         ]);
 
-        return response()->json(['message' => 'Refund approved. Process offline: cash or bank transfer.']);
+        return response()->json(['message' => 'Refund approved. Process the ' . $request->refund_method . ' payment offline.']);
     }
 
     public function rejectRefund(Request $request, $id)
     {
-        $request->validate(['note' => 'required|string']);
+        $request->validate(['admin_note' => 'required|string']);
+
         $refund = \App\Models\Refund::findOrFail($id);
         if ($refund->status !== 'pending') {
             return response()->json(['error' => 'Refund already processed.'], 400);
         }
+
         $refund->update([
-            'status'      => 'rejected',
-            'admin_id'    => auth('api')->id(),
-            'admin_note'  => $request->note,
+            'status'       => 'rejected',
+            'admin_id'     => auth('api')->id(),
+            'admin_note'   => $request->admin_note,
             'processed_at' => now(),
+            'resolved_at'  => now(),
         ]);
+
         return response()->json(['message' => 'Refund rejected.']);
     }
 
@@ -358,11 +439,15 @@ class AdminController extends Controller
             $query->where('role', $request->role);
         }
 
-        $users = $query->whereNotNull('device_token')->get();
+        // PRD §4.8: Query device_tokens table instead of users.device_token
+        $userIds = $query->pluck('id');
+        $tokens = \App\Models\DeviceToken::whereIn('user_id', $userIds)->get();
+
+        // TODO: Send FCM push to each token
 
         return response()->json([
             'message'    => 'Broadcast queued.',
-            'recipients' => $users->count(),
+            'recipients' => $tokens->groupBy('user_id')->count(),
         ]);
     }
 }

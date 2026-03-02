@@ -19,7 +19,7 @@ class OrderNewEvent implements ShouldBroadcast
 
     public function __construct(Order $order)
     {
-        $this->order = $order->load('restaurant', 'items.menuItem');
+        $this->order = $order->load('store', 'items.product');
     }
 
     public function broadcastOn(): array

@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Api\AdminController;
+use App\Http\Controllers\Api\AdminAnalyticsController;
 use App\Http\Controllers\Api\AdminPromotionController;
 use App\Http\Controllers\Api\AuditController;
 use App\Http\Controllers\Api\AuthController;
@@ -11,9 +12,9 @@ use App\Http\Controllers\Api\OrderController;
 use App\Http\Controllers\Api\PaymentController;
 use App\Http\Controllers\Api\ProfileController;
 use App\Http\Controllers\Api\PromotionController;
+use App\Http\Controllers\Api\RefundController;
 use App\Http\Controllers\Api\StoreController;
 use App\Http\Controllers\Api\StoreDashboardController;
-use App\Http\Controllers\Api\ReviewController;
 use App\Http\Controllers\Api\SocketController;
 
 use App\Http\Middleware\RoleMiddleware;
@@ -23,14 +24,14 @@ use Illuminate\Support\Facades\Route;
 // PUBLIC AUTH ROUTES
 // ============================================================
 Route::group(['prefix' => 'auth'], function () {
-    // Phone-first OTP auth (customers — PRD lazy signup)
+    // Phone-first OTP auth (customers — PRD §3 lazy signup)
     Route::post('request-otp',          [AuthController::class, 'requestOtp']);
     Route::post('verify-otp',           [AuthController::class, 'verifyOtp']);
 
-    // Traditional auth (store owners, admins)
-    Route::post('register-store',       [AuthController::class, 'registerStore']);
+    // Traditional auth (store owners login after admin creates their account — PRD §9.2)
     Route::post('login',                [AuthController::class, 'login']);
     Route::post('refresh',              [AuthController::class, 'refresh']);
+    // NOTE: No register-store route — store owner accounts are created by admin only (PRD §9.2)
 });
 
 // PAYMENT WEBHOOK — public (no JWT)
@@ -38,6 +39,9 @@ Route::post('payment/webhook', [PaymentController::class, 'webhook']);
 
 // PUBLIC: List categories (for anonymous browsing)
 Route::get('categories', [StoreController::class, 'categories']);
+
+// PUBLIC: Store reviews listing — no auth required (PRD §18.2)
+Route::get('stores/{id}/reviews', \App\Http\Controllers\Stores\V1\IndexReviewsController::class);
 
 // ============================================================
 // PROTECTED ROUTES (requires JWT)
@@ -63,13 +67,10 @@ Route::group(['middleware' => 'auth:api'], function () {
     // --- Public Stores (any authenticated user) ---
     Route::get('stores',                    [StoreController::class, 'index']);
     Route::get('stores/nearby',             [StoreController::class, 'nearby']);
-    Route::get('stores/{id}',               [StoreController::class, 'show']);
-    Route::get('stores/{id}/reviews',       [StoreController::class, 'reviews']);
+    Route::get('stores/{id}',                       [StoreController::class, 'show']);
 
     // --- Reviews ---
-    Route::post('stores/{id}/reviews',      [ReviewController::class, 'store']);
-    Route::put('reviews/{id}',              [ReviewController::class, 'update']);
-    Route::delete('reviews/{id}',           [ReviewController::class, 'destroy']);
+    // Handled in separate V1 controllers
 
     // --- Socket Token ---
     Route::post('socket/token', [SocketController::class, 'generateToken']);
@@ -83,8 +84,6 @@ Route::group(['middleware' => 'auth:api'], function () {
         Route::get('orders/{id}',                       [OrderController::class, 'show']);
         Route::patch('orders/{id}/cancel',              [OrderController::class, 'cancel']);
         Route::get('orders/{id}/tracking',              [OrderController::class, 'track']);
-        Route::post('orders/{id}/confirm-delivery',     [OrderController::class, 'confirmDelivery']);
-        Route::post('orders/{id}/report-issue',         [OrderController::class, 'reportIssue']);
         Route::post('orders/{id}/reorder',              [OrderController::class, 'reorder']);
     });
 
@@ -103,6 +102,7 @@ Route::group(['middleware' => 'auth:api'], function () {
             Route::post('orders/{id}/reject',           [CourierController::class, 'rejectOrder']);
             Route::post('orders/{id}/pickup',           [CourierController::class, 'pickupOrder']);
             Route::post('orders/{id}/deliver',          [CourierController::class, 'deliverOrder']);
+            Route::put('orders/{id}/note',              [CourierController::class, 'updateOrderNote']); // PRD §5.6
             Route::get('earnings',                      [CourierController::class, 'earnings']);
         });
     });
@@ -133,6 +133,7 @@ Route::group(['middleware' => 'auth:api'], function () {
         Route::put('orders/{id}/accept',                [StoreDashboardController::class, 'acceptOrder']);
         Route::put('orders/{id}/ready',                 [StoreDashboardController::class, 'orderReady']);
         Route::put('orders/{id}/reject',                [StoreDashboardController::class, 'rejectOrder']);
+        Route::put('orders/{id}/note',                  [StoreDashboardController::class, 'updateOrderNote']); // PRD §5.6
 
         // Analytics (PRD §7.3)
         Route::get('analytics/revenue',                 [StoreDashboardController::class, 'revenueAnalytics']);
@@ -156,10 +157,11 @@ Route::group(['middleware' => 'auth:api'], function () {
         Route::patch('couriers/{id}/status',            [AdminController::class, 'updateCourierStatus']);
         Route::get('couriers/{id}/monthly-stats',       [AdminController::class, 'courierMonthlyStats']);
 
-        // Stores
+        // Stores — PRD §9.2: Admin creates stores/owners directly; no pending/approval flow
         Route::get('stores',                            [AdminController::class, 'stores']);
-        Route::get('stores/pending',                    [AdminController::class, 'pendingStores']);
-        Route::post('stores/{id}/approve',              [AdminController::class, 'approveStore']);
+        Route::post('store-owners',                     [AdminController::class, 'createStoreOwner']);
+        Route::post('stores',                           [AdminController::class, 'createStore']);
+        Route::put('stores/{id}',                       [AdminController::class, 'updateStoreStatus']);
         Route::patch('stores/{id}/status',              [AdminController::class, 'updateStoreStatus']);
 
         // Orders
@@ -167,13 +169,22 @@ Route::group(['middleware' => 'auth:api'], function () {
         Route::get('orders/{id}',                       [AdminController::class, 'showOrder']);
         Route::patch('orders/{id}/force-status',        [AdminController::class, 'forceOrderStatus']);
 
-        // Analytics
+        // Analytics — KPI summary
         Route::get('analytics',                         [AdminController::class, 'analytics']);
+
+        // Analytics — Detailed breakdowns (PRD §9.3) — support ?period=week|month|all
+        Route::get('analytics/revenue',                 [AdminAnalyticsController::class, 'revenue']);
+        Route::get('analytics/orders',                  [AdminAnalyticsController::class, 'orders']);
+        Route::get('analytics/stores',                  [AdminAnalyticsController::class, 'stores']);
+        Route::get('analytics/couriers',                [AdminAnalyticsController::class, 'couriers']);
 
         // Menu Change Approvals
         Route::get('menu-changes',                      [AdminController::class, 'pendingMenuChanges']);
         Route::post('menu-changes/{id}/approve',        [AdminController::class, 'approveMenuChange']);
         Route::post('menu-changes/{id}/reject',         [AdminController::class, 'rejectMenuChange']);
+
+        // Admin Moderation
+        Route::delete('reviews/{id}',                   \App\Http\Controllers\Admin\Reviews\V1\DestroyController::class);
 
         // Categories
         Route::get('categories',                        [AdminController::class, 'categoriesList']);
@@ -189,13 +200,10 @@ Route::group(['middleware' => 'auth:api'], function () {
         Route::put('promotions/{id}',                   [AdminPromotionController::class, 'update']);
         Route::delete('promotions/{id}',                [AdminPromotionController::class, 'destroy']);
 
-        // Reviews Moderation
-        Route::delete('reviews/{id}',                   [ReviewController::class, 'adminDestroy']);
-
-        // Refunds
+        // Refunds (PRD §10.2)
         Route::get('refunds',                           [AdminController::class, 'refunds']);
-        Route::post('refunds/{id}/approve',             [AdminController::class, 'approveRefund']);
-        Route::post('refunds/{id}/reject',              [AdminController::class, 'rejectRefund']);
+        Route::put('refunds/{id}/approve',              [AdminController::class, 'approveRefund']);
+        Route::put('refunds/{id}/reject',               [AdminController::class, 'rejectRefund']);
 
         // Notifications Broadcast
         Route::post('notifications/broadcast',          [AdminController::class, 'broadcastNotification']);
@@ -207,12 +215,22 @@ Route::group(['middleware' => 'auth:api'], function () {
     });
 
     // ============================================================
-    // PAYMENTS
+    // PAYMENTS & REFUNDS
     // ============================================================
     Route::post('payment/checkout',         [PaymentController::class, 'checkout']);
     Route::get('payment/history',           [PaymentController::class, 'history']);
     Route::post('payment/refund-request',   [PaymentController::class, 'refundRequest']);
     Route::get('payment/refund-status/{id}',[PaymentController::class, 'refundStatus']);
+
+    // Reviews (require isolated PRD 18 logic)
+    require __DIR__ . '/api/reviews.php';
+
+    // Reports (require isolated PRD 19 logic)
+    require __DIR__ . '/api/reports.php';
+
+    // Customer refund list & submission (PRD §10.2)
+    Route::get('refunds',                   [RefundController::class, 'index']);
+    Route::post('refunds',                  [RefundController::class, 'store']);
 
     // ============================================================
     // PROMOTIONS

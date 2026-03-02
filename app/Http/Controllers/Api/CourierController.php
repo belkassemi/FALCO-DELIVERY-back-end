@@ -6,9 +6,10 @@ use App\Http\Controllers\Controller;
 use App\Models\Order;
 use App\Models\CourierLocation;
 use App\Models\CourierEarning;
+use App\Models\CourierMonthlyStat;
 use App\Models\OrderDispatchLog;
 use App\Events\OrderAssignedEvent;
-use App\Events\OrderLocationUpdateEvent;
+use App\Events\CourierLocationUpdated;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Http\Request;
 
@@ -48,13 +49,17 @@ class CourierController extends Controller
             [$request->lng, $request->lat, $courier->id]
         );
 
-        // Broadcast to customers tracking active orders
-        $activeOrders = Order::where('courier_id', $courier->id)
-            ->whereIn('status', ['assigned', 'preparing', 'on_the_way'])
-            ->get();
+        // Broadcast to customer tracking their active order (PRD §8.2)
+        $activeOrder = Order::where('courier_id', $courier->id)
+            ->whereIn('status', ['courier_assigned', 'preparing', 'ready', 'picked_up'])
+            ->first();
 
-        foreach ($activeOrders as $order) {
-            broadcast(new OrderLocationUpdateEvent($order->id, $request->lat, $request->lng));
+        if ($activeOrder) {
+            broadcast(new CourierLocationUpdated(
+                $activeOrder->id,
+                $request->lat,
+                $request->lng,
+            ))->toOthers();
         }
 
         return response()->json(['message' => 'Location updated successfully']);
@@ -65,8 +70,9 @@ class CourierController extends Controller
         return DB::transaction(function () use ($id) {
             $order = Order::lockForUpdate()->findOrFail($id);
 
-            if ($order->status !== 'pending') {
-                return response()->json(['error' => 'Order cannot be accepted because it is no longer pending.'], 400);
+            // PRD §5.1: Must be in courier_searching status
+            if ($order->status !== Order::STATUS_COURIER_SEARCHING) {
+                return response()->json(['error' => 'Order is no longer available for acceptance.'], 400);
             }
             if ($order->courier_id !== null) {
                 return response()->json(['error' => 'Order already accepted by another courier.'], 409);
@@ -74,7 +80,7 @@ class CourierController extends Controller
 
             $order->update([
                 'courier_id' => auth('api')->id(),
-                'status'     => 'assigned'
+                'status'     => Order::STATUS_COURIER_ASSIGNED,
             ]);
 
             OrderDispatchLog::where('order_id', $id)
@@ -85,7 +91,7 @@ class CourierController extends Controller
 
             return response()->json([
                 'message'     => 'Order assigned successfully',
-                'orderStatus' => 'assigned'
+                'orderStatus' => Order::STATUS_COURIER_ASSIGNED,
             ]);
         });
     }
@@ -93,14 +99,19 @@ class CourierController extends Controller
     public function pickupOrder($id)
     {
         $order = Order::findOrFail($id);
-        $order->update(['status' => 'on_the_way']);
-        return response()->json(['message' => 'Order picked up', 'status' => 'on_the_way']);
+        $order->update(['status' => 'picked_up']);
+        return response()->json(['message' => 'Order picked up', 'status' => 'picked_up']);
     }
 
     public function deliverOrder($id)
     {
         $order = Order::findOrFail($id);
-        $order->update(['status' => 'delivered', 'payment_status' => 'paid']);
+
+        if ($order->status !== Order::STATUS_PICKED_UP) {
+            return response()->json(['error' => 'Order must be picked up before marking as delivered.'], 400);
+        }
+
+        $order->update(['status' => Order::STATUS_DELIVERED, 'payment_status' => 'paid']);
 
         // Record courier earnings (PRD §8.3 — cash-based, for visibility)
         CourierEarning::create([
@@ -110,7 +121,18 @@ class CourierController extends Controller
             'type'       => 'delivery',
         ]);
 
-        return response()->json(['message' => 'Order delivered', 'status' => 'delivered']);
+        // PRD §8.4: Update courier monthly stats
+        $month = now()->format('Y-m');
+        $stat = CourierMonthlyStat::firstOrCreate(
+            ['courier_id' => auth('api')->id(), 'month' => $month],
+            ['total_deliveries' => 0, 'total_distance_km' => 0]
+        );
+        $stat->increment('total_deliveries');
+        if ($order->delivery_distance_km) {
+            $stat->increment('total_distance_km', $order->delivery_distance_km);
+        }
+
+        return response()->json(['message' => 'Order delivered', 'status' => Order::STATUS_DELIVERED]);
     }
 
     public function rejectOrder($id)
@@ -126,7 +148,8 @@ class CourierController extends Controller
 
     public function availableOrders()
     {
-        $orders = Order::where('status', 'pending')
+        // PRD §5.1: Only show orders in courier_searching status
+        $orders = Order::where('status', Order::STATUS_COURIER_SEARCHING)
             ->whereNull('courier_id')
             ->with('store', 'customer')
             ->latest()
@@ -151,5 +174,24 @@ class CourierController extends Controller
             'total_earnings' => $totalEarnings,
             'history'        => $earnings,
         ]);
+    }
+
+    /**
+     * PUT /api/courier/orders/{id}/note
+     * Courier can add/update note between courier_assigned and picked_up.
+     */
+    public function updateOrderNote(Request $request, $id)
+    {
+        $request->validate(['note' => 'required|string|max:500']);
+
+        $order = Order::where('courier_id', auth('api')->id())->findOrFail($id);
+
+        if (!in_array($order->status, ['courier_assigned', 'preparing', 'ready'])) {
+            return response()->json(['error' => 'Notes can only be added once the order is assigned and before pickup.'], 400);
+        }
+
+        $order->update(['courier_note' => $request->note]);
+
+        return response()->json(['message' => 'Note saved successfully.', 'courier_note' => $request->note]);
     }
 }

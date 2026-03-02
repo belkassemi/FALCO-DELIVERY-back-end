@@ -1,434 +1,974 @@
+========================================================
 FALCO DELIVERY
-Product Requirements Document
+Product Requirements Document — Version 2.0
+March 2026 — Laâyoune, Maroc
+========================================================
+Stack: Laravel + PostgreSQL + PostGIS + Redis + WebSockets + FCM + Flutter
+========================================================
 
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CHANGES SUMMARY — v1.0 → v2.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. Vision & Objectives
-Falco Delivery is a Moroccan on-demand multi-service delivery platform inspired by Glovo, designed specifically for the Moroccan market and user behavior. The core philosophy minimizes friction, avoids forced account creation at startup, and uses phone number as the primary identity.
+Section   Change                                              Type
+--------  --------------------------------------------------  -------
+§3.4      ToS enforcement — two layers, verify step           Updated
+§5.1      Order lifecycle — store verification added          Updated
+§5.6      Order notes — 3-level (customer/store/courier)      New
+§5.7      Store verification flow before courier dispatch     New
+§8.5      Courier assignment — Push + REST fallback           New
+§8.6      Delivery confirmation + prohibited methods          New
+§9.2      Store creation — admin only, no approval flow       Updated
+§9.3      Admin analytics — 4 endpoints + period filter       New
+§10.2     Refund endpoints — FCM + SMS on resolution          Updated
+§10.3     Promo codes — category eligibility                  New
+§11.3     Flutter + FCM — mobile framework decision           New
+§18       Reviews — product at delivery + store anytime       New
+§19       Issue reporting — 7 categories, admin resolution    New
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. VISION & OBJECTIVES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Falco Delivery is a Moroccan on-demand multi-service delivery platform
+inspired by Glovo, designed specifically for the Moroccan market and
+user behavior. The core philosophy minimizes friction, avoids forced
+account creation at startup, and uses phone number as the primary identity.
 
 1.1 Key Objectives
-Phone-first authentication — no email required
-Lazy account creation — registration only at checkout
-Multi-category marketplace: Food, Pharmacy, Market, Smoking
-Age-restricted product compliance (Glovo model)
-Moroccan legal compliance — SMS, ToS, age confirmation logging
-Scalable monolith architecture for Phase 1
+------------------
+  - Phone-first authentication — no email required
+  - Lazy account creation — registration only at checkout
+  - Multi-category marketplace: Food, Pharmacy, Market, Smoking
+  - Age-restricted product compliance (Glovo model)
+  - Moroccan legal compliance — SMS, ToS, age confirmation logging
+  - Scalable monolith architecture for Phase 1
+  - Store verification before courier dispatch — reduces fake orders
 
 1.2 Supported Categories
+-------------------------
+  Category    Description                    Age Restricted
+  ----------  -----------------------------  --------------
+  Food        Restaurants and food delivery  No
+  Pharmacy    Medicines and health products  Some items
+  Market      Groceries and daily goods      No
+  Smoking     Tobacco and related products   Yes — all items
 
 
-2. User Roles & Permissions
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. USER ROLES & PERMISSIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Role          How Created                        Auth Method
+  ------------  ---------------------------------  -------------------
+  Customer      Lazy signup — OTP at first order   OTP only
+  Store Owner   Admin creates account              Email + password
+  Courier       Admin creates + activation code    Activation code
+  Admin         Pre-existing                       Email + password
 
 
-3. Authentication System — Phone-First / Lazy Signup
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. AUTHENTICATION SYSTEM — PHONE-FIRST / LAZY SIGNUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 3.1 Core Principles
-No registration screen on app launch
-User browses freely as anonymous
-Registration triggered only at first checkout
-Phone number is the primary identity key
-Email is optional (nullable)
-No password system — OTP only
+-------------------
+  - No registration screen on app launch
+  - User browses freely as anonymous
+  - Registration triggered only at first checkout
+  - Phone number is the primary identity key
+  - Email is optional (nullable)
+  - No password system for customers — OTP only
 
 3.2 OTP Registration Flow
+--------------------------
+  1. User reaches checkout for the first time
+  2. Flutter shows phone input + ToS checkbox
+  3. User checks ToS box → "Send OTP" button becomes active
+  4. POST /api/auth/request-otp — OTP stored in Redis (TTL 5min)
+  5. SMS sent to user phone
+  6. User enters 6-digit code → POST /api/auth/verify-otp
+  7. Backend validates, creates user if new, returns Sanctum token
+  8. ToS acceptance logged to tos_acceptances table
+  9. Checkout resumes automatically
 
 3.3 OTP Security Parameters
+-----------------------------
+  Parameter         Value
+  ----------------  -------------------------------------
+  OTP length        6 digits
+  TTL               5 minutes (Redis)
+  Max attempts      3 per 10 minutes per phone
+  Rate limit key    throttle:otp:{phone} (Redis)
+  Storage           Redis only — not in DB until verified
+  Invalidation      Immediately after successful use
 
-3.4 ToS Acceptance — Enforcement Rules (Updated)
-ToS acceptance is required only on first registration (new phone number). Returning users who have already accepted the ToS are not prompted again unless the ToS version changes in the future.
-Enforcement Strategy — Two Layers
-Layer 1 — Frontend (Flutter)
-The "Send OTP" button is disabled until the user checks the consent box:
-"I agree to the Terms of Service and Privacy Policy."
-The button cannot be tapped until the checkbox is checked. This prevents the OTP request from being made without consent. This layer protects against accidental submission.
-Layer 2 — Backend (Laravel)
-The backend validates tos_accepted: true at the verify OTP step, not the request OTP step. This is the legally binding moment — when the user has confirmed their phone number and actively verified their identity via OTP.
-If tos_accepted is missing or false and the phone number is new, the backend returns:
-json{
-  "message": "You must accept the Terms of Service to create an account.",
-  "code": "TOS_NOT_ACCEPTED"
-}
-Updated POST /api/auth/verify-otp Logic
-json{
-  "phone": "+212600123456",
-  "otp": "123456",
-  "tos_accepted": true
-}
-Scenariotos_accepted required?ActionNew phone number✅ Yes — must be trueCreate account + log tos_acceptancesExisting phone number❌ No — field ignoredJust return token
-tos_acceptances Table — What Gets Logged
-FieldValueuser_idNewly created user IDtos_versionCurrent ToS version (e.g. "1.0") — hardcoded in configip_addressRequest IP addressaccepted_atCurrent timestamp
-Why Validated at Verify Step Not Request Step
-The request-otp step does not yet confirm the user owns the phone number. Logging ToS acceptance before OTP verification would mean recording consent from an unverified identity. Validating at verify-otp ensures the acceptance is tied to a confirmed, verified phone number — which is the legally correct moment to log consent under Moroccan compliance requirements.
+  ❌ DO NOT store OTP in the database before verification
+  ❌ DO NOT allow more than 3 attempts per 10 minutes
+  ❌ DO NOT reuse OTP after successful verification
 
-Table: tos_acceptances
+3.4 ToS Acceptance — Enforcement Rules
+----------------------------------------
+ToS acceptance required only on first registration (new phone number).
+Returning users not prompted again unless ToS version changes.
 
-Table: phone_otps
+Two-Layer Enforcement:
+
+  Layer 1 — Flutter (UI):
+    "Send OTP" button disabled until ToS checkbox is checked.
+    Cannot be bypassed in the UI.
+
+  Layer 2 — Backend (Laravel):
+    Validates tos_accepted: true at verify-otp step only.
+    This is the legally binding moment tied to a verified phone.
+
+  Scenario              tos_accepted Required?   Action
+  --------------------  -----------------------  ------------------------
+  New phone number      Yes — must be true        Create account + log ToS
+  Existing phone        No — field ignored        Return token only
+
+  ❌ DO NOT validate ToS at request-otp step — phone not yet verified
+  ❌ DO NOT skip ToS logging for new users — required for Moroccan compliance
+  ❌ DO NOT allow new account creation without tos_accepted: true
+
+  tos_acceptances table logs: user_id, tos_version, ip_address, accepted_at
 
 
-4. Database Schema
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. DATABASE SCHEMA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 4.1 Core Tables
-Table: users
-
-Table: addresses
+----------------
+  users             id, phone (UNIQUE), email (nullable), name, role, is_blocked
+  addresses         id, user_id, label, address, lat, lng, is_default
+  tos_acceptances   id, user_id, tos_version, ip_address, accepted_at
+  phone_otps        id, phone, otp_hash, expires_at, used_at, attempts
 
 4.2 Categories & Stores
-Table: categories
-
-Table: stores
-
-Table: store_hours
-
-Table: store_closures
+------------------------
+  categories      id, name, slug, icon, is_active
+  stores          id, owner_id, category_id, name, coords (geography Point), is_active
+  store_hours     id, store_id, day_of_week, open_time, close_time
+  store_closures  id, store_id, closure_date, reason
 
 4.3 Products
-Table: products
-
-Table: menu_change_requests
-
+-------------
+  products              id, store_id, name, price, is_available, age_restricted, deleted_at
+  menu_change_requests  id, store_id, product_id, type, requested_data (jsonb), status, admin_note
 
 4.4 Orders
-Table: orders
+-----------
+  orders
+    id, user_id, store_id, courier_id, status (enum), total, delivery_fee,
+    delivery_distance_km, age_confirmation, age_confirmation_at,
+    promo_code_id, customer_note, store_note, courier_note
 
-Table: order_items
+  order_items
+    id, order_id, product_id, quantity, unit_price, subtotal
 
-Table: order_assignment_attempts
+  order_assignment_attempts
+    id, order_id, courier_id, status (sent/accepted/rejected/timeout),
+    sent_at, responded_at
+
+  ❌ DO NOT use wallet or balance fields — no wallet system in Phase 1
+  ❌ DO NOT remove note fields — required by PRD §5.6
 
 4.5 Couriers
-Table: couriers
-
-Table: courier_monthly_stats
-
+-------------
+  couriers               id, name, phone (UNIQUE), is_activated, is_online,
+                         current_location (geography Point), activation_code
+  courier_monthly_stats  id, courier_id, month, deliveries_count, total_distance_km
+  courier_earnings       id, courier_id, order_id, amount, earned_at
 
 4.6 Payments & Promo Codes
-Table: payments
+---------------------------
+  payments        id, order_id, amount, method, status, paid_at
+  promo_codes     id, code (UNIQUE), discount_type, discount_value,
+                  eligible_categories (jsonb), min_order_amount,
+                  max_uses, expires_at, is_active
+  promo_code_uses id, promo_code_id, user_id, order_id, used_at
 
-Table: promo_codes
-
-Table: promo_code_uses
-
-4.7 Refunds, Reviews & Favorites
-Table: refund_requests
-
-Table: reviews
-
-Table: user_favorites
-
+4.7 Refunds, Reviews, Reports & Favorites
+------------------------------------------
+  refund_requests  id, order_id, user_id, reason, status, refund_method,
+                   admin_note, resolved_at
+  reviews          id, user_id, store_id (nullable), order_item_id (nullable),
+                   order_id, type (store/product), rating (1-5), comment, deleted_at
+  user_favorites   id, user_id, store_id
+  order_reports    id, order_id, user_id, type (enum), description,
+                   status (open/resolved), admin_response, action_taken, resolved_at
 
 4.8 System & Logging Tables
-Table: settings
+-----------------------------
+  settings      id, key (UNIQUE), value, type
+  sms_logs      id, phone, type, provider, status, provider_message_id, sent_at
+  audit_logs    id, user_id, action, model, model_id, changes (jsonb), created_at
+  device_tokens id, user_id, token, platform (android/ios), updated_at
 
-Table: sms_logs
+  ❌ DO NOT delete sms_logs — required for ANRT compliance
+  ❌ DO NOT delete audit_logs — required for dispute handling
 
-Table: audit_logs
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. ORDER FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-5. Order Flow
-5.1 Customer Order Lifecycle
+5.1 Complete Order Status Sequence
+------------------------------------
+  Status              Triggered By   Description
+  ------------------  -------------  ------------------------------------
+  pending             Customer       Order placed, payment confirmed
+  store_notified      System         SMS + dashboard sent to store
+  store_confirmed     Store Owner    Store called customer, verified, accepted
+  courier_searching   System         Courier search begins after confirmation
+  courier_assigned    System         Courier accepted within 20s window
+  preparing           Store Owner    Kitchen starts preparing
+  ready               Store Owner    Food ready — courier notified
+  picked_up           Courier        Courier collected from store
+  delivered           Courier        Order handed to customer
+  rejected            Store Owner    Store rejected after verification call
+  cancelled           System/Admin   Cancelled at any stage
+
+  ❌ DO NOT start courier search before store_confirmed status
+  ❌ DO NOT use old statuses: assigned, on_the_way
+  ❌ DO NOT skip store_notified step — it is legally required
 
 5.2 Cascading Courier Assignment
-Courier assignment is based on restaurant/store coordinates, not customer address. The system finds the nearest online and activated courier.
+----------------------------------
+  - Based on store coordinates (NOT customer address)
+  - PostGIS: ORDER BY ST_Distance(courier.location, store.coords)
+             WHERE is_online AND is_activated
+  - 20-second acceptance window per courier
+  - Timeout/reject → logged to order_assignment_attempts → next courier
+  - No courier available → status: no_courier_found → admin + store notified
 
+  ❌ DO NOT use customer address for courier search radius
+  ❌ DO NOT skip logging to order_assignment_attempts
 
 5.3 Delivery Fee Calculation
-The admin configures a cost_per_km value in the settings table. At checkout, the system calculates:
+------------------------------
+  Delivery Fee = cost_per_km (settings table)
+               × ST_Distance(store_coords → customer_coords)
 
-Delivery Fee = cost_per_km × distance(store_coords → customer_coords)
+  Result stored as delivery_distance_km on the order record.
 
-Distance is calculated using the Haversine formula. The result is stored in delivery_distance_km on the order record and used for both fee calculation and courier stats.
+  ❌ DO NOT hardcode cost_per_km — must come from settings table
+  ❌ DO NOT use Haversine manually — use PostGIS ST_Distance with SRID 4326
 
 5.4 Reorder Shortcut
-A POST /orders/{id}/reorder endpoint pre-fills the cart from a past order. If any product is no longer available, the system flags those items to the customer rather than silently dropping them.
-5.5 Revised Order Lifecycle & Status Flow
-Order Status Sequence
-The complete order lifecycle follows this sequence:
-pending → courier_searching → courier_assigned → preparing → ready → picked_up → delivered
-StatusTriggered ByDescriptionpendingCustomerOrder placed, payment method confirmedcourier_searchingSystemImmediately starts cascading courier search based on store coordinatescourier_assignedSystemCourier accepted the assignment within 20s windowpreparingStore OwnerStore confirmed order and started preparingreadyStore OwnerFood is ready for pickup, courier notifiedpicked_upCourierCourier collected the order from storedeliveredCourierOrder handed to customer
-Key Logic Change — Courier Assignment Timing
-Courier search begins immediately after the customer places the order, not after store acceptance. This ensures the courier is already at or near the store by the time the food is ready, minimizing wait time. The store is notified of the order simultaneously with the courier assignment confirmation.
-Endpoints affected:
+----------------------
+  POST /orders/{id}/reorder pre-fills cart from past order.
+  If any product unavailable → flag to customer, do NOT silently drop.
 
-PUT /api/store/orders/{id}/accept → triggers preparing status
-PUT /api/store/orders/{id}/ready → triggers ready status + pushes FCM notification to courier
-POST /api/courier/orders/{id}/pickup → triggers picked_up status
-POST /api/courier/orders/{id}/deliver → triggers delivered status
+  ❌ DO NOT silently drop unavailable products on reorder
 
+5.5 Order Lifecycle Summary
+-----------------------------
+  See Section 5.1 for complete status table.
+  Courier search begins ONLY after store_confirmed — not at placement.
 
 5.6 Order Notes System
-Orders support a three-level notes system allowing communication between all parties involved in the delivery.
-Notes Fields on orders Table
-FieldTypeWritten ByVisible ToExamplecustomer_notetext NULLABLECustomerStore + Courier"I'm on the 5th floor, please ring bell 3"store_notetext NULLABLEStore OwnerCourier"Order not started yet, please wait 10 minutes"courier_notetext NULLABLECourierStore Owner"I'm stuck in traffic, arriving in 15 minutes"
-When Notes Are Set
+------------------------
+  Three note fields on orders table:
 
-customer_note — submitted at checkout inside the order request body. Cannot be edited after placement.
-store_note — can be added or updated any time between preparing and ready statuses via PUT /api/store/orders/{id}/note.
-courier_note — can be added or updated any time between courier_assigned and picked_up statuses via PUT /api/courier/orders/{id}/note.
+  Field           Written By    Visible To       Editable Until
+  --------------  ------------  ---------------  --------------------------
+  customer_note   Customer      Store + Courier  Order placement only
+  store_note      Store Owner   Courier          Between preparing → ready
+  courier_note    Courier       Store Owner      Between assigned → picked_up
 
-Updated Order Placement Request Body
-json{
-  "store_id": 1,
-  "address_id": 4,
-  "items": [
-    {"product_id": 12, "quantity": 1, "options": []}
-  ],
-  "age_confirmation": true,
-  "promo_code": "FALCO2026",
-  "customer_note": "I'm on the 5th floor, please don't ring the bell after 10pm"
-}
-New Endpoints to Add to API Guide
-EndpointRoleDescriptionPUT /api/store/orders/{id}/noteStore OwnerAdd or update store note visible to courierPUT /api/courier/orders/{id}/noteCourierAdd or update courier note visible to storePUT /api/store/orders/{id}/readyStore OwnerMark order as ready for pickup
+  Endpoints:
+    PUT /api/store/orders/{id}/note    — store_note
+    PUT /api/courier/orders/{id}/note  — courier_note
+    PUT /api/store/orders/{id}/ready   — mark ready
 
-6. Age-Restricted Products
-6.1 Applicable Products
+  ❌ DO NOT allow customer to edit note after order placement
+  ❌ DO NOT allow store to edit note after ready status
+  ❌ DO NOT allow courier to edit note after picked_up status
 
-6.2 Confirmation Flow
-User adds age-restricted product to cart
-Modal displayed: 'I confirm that I am of legal age to purchase this product.'
-User must click 'I Agree' to continue — cannot be bypassed
-age_confirmation = true and age_confirmation_at timestamp recorded on order
-No ID verification required — self-declaration model (Glovo compliance standard)
-No birthdate stored
+5.7 Store Verification Flow [NEW v2.0]
+----------------------------------------
+PURPOSE: Removes platform liability for fake and prank orders.
+Store must manually verify the order by calling the customer BEFORE
+any courier is dispatched.
+
+  Flow:
+  -----
+    Customer places order
+          ↓
+    System sends SMS + dashboard notification to store:
+      "[FALCO DELIVERY] طلب جديد
+       الزبون: Youssef — +212600123456
+       المبلغ: 150.00 درهم
+       الرجاء التحقق والرد على لوحة التحكم"
+          ↓
+    Store calls customer to verify order is legitimate
+          ↓
+         / \
+        /   \
+    Accept   Reject
+       ↓        ↓
+  courier    status: rejected
+  search     customer notified
+  begins     FCM + SMS
+
+  Customer's full phone number is visible to store owner — required
+  for the verification call.
+
+  Store Endpoints:
+    PUT /api/store/orders/{id}/accept  → store_confirmed → courier search starts
+    PUT /api/store/orders/{id}/reject  → rejected → customer notified
+
+  Why This Change:
+    - Platform not liable for unverified orders
+    - Prevents prank orders (especially from children)
+    - Store has full authority to reject suspicious orders
+    - No courier dispatched until order confirmed legitimate
+
+  ❌ DO NOT start courier search before store accepts
+  ❌ DO NOT hide customer phone from store — required for verification call
+  ❌ DO NOT allow system to auto-accept on store's behalf
+  ❌ DO NOT remove the store_notified status step
 
 
-7. Store Features
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. AGE-RESTRICTED PRODUCTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Applicable to: All Smoking category + age_restricted = true products.
+
+  Flow:
+    1. User adds age-restricted product to cart
+    2. Modal displayed — cannot be bypassed
+    3. User must tap "I Agree" to continue
+    4. age_confirmation = true + age_confirmation_at = NOW() on order
+
+  ❌ DO NOT allow bypass of age confirmation modal
+  ❌ DO NOT store birthdate — self-declaration only (Glovo compliance model)
+  ❌ DO NOT require ID verification in Phase 1
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. STORE FEATURES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 7.1 Store Hours & Calendar
-Admin sets opening hours at store creation. Store owners can customize hours and add one-off closure dates via calendar.
+---------------------------
+  - store_hours: weekly schedule per day_of_week
+  - store_closures: exceptional dates (holidays, Eid, maintenance)
+  - System auto-determines open/closed — no manual toggle
+  - Response includes: is_open, closes_at, next_open_at, closure_reason
 
-store_hours table defines weekly schedule (per day_of_week)
-store_closures table handles exceptional dates (holidays, maintenance)
-Moroccan public holidays (Eid, Throne Day, etc.) added manually by admin or store owner
-System automatically shows store as closed based on schedule — no manual toggle needed
+  ❌ DO NOT add manual open/close toggle — auto-computed only
+  ❌ DO NOT show store as open during a store_closures date
 
 7.2 Menu Governance
-Store owners cannot directly create, edit, or delete menu items. All changes go through an admin-approval workflow:
+--------------------
+  Store owners CANNOT directly create, edit, or delete menu items.
+  All changes go through admin-approval workflow.
 
+  Flow:
+    Store Owner → POST /api/store/menu (creates pending request)
+    Admin → GET /api/admin/menu-changes (reviews)
+    Admin → POST /api/admin/menu-changes/{id}/approve or /reject
+    System → applies to products table only after approval
+
+  ❌ DO NOT allow store owners to directly modify products table
+  ❌ DO NOT auto-approve menu changes — admin must review
 
 7.3 Store Owner Analytics
-Computed from orders data via API endpoints — no dedicated analytics tables required:
+--------------------------
+  GET /api/store/analytics/revenue       — daily revenue last 30 days
+  GET /api/store/analytics/top-products  — top 10 best-selling products
+  GET /api/store/analytics/volume        — order volume by day/week/month
 
-GET /store/analytics/revenue — daily revenue for last 30 days
-GET /store/analytics/top-products — top 10 best-selling products
-GET /store/analytics/volume — order volume by day/week/month
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. COURIER FEATURES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-8. Courier Features
 8.1 Account Lifecycle
-Courier accounts created exclusively by admin
-Admin generates one-time activation code
-Courier activates account using code → is_activated = true
-EnsureCourierIsActivated middleware protects all courier endpoints
+----------------------
+  - Courier accounts created exclusively by admin
+  - Admin generates one-time activation code
+  - Courier activates: POST /api/courier/activate → is_activated = true
+  - EnsureCourierIsActivated middleware protects all courier endpoints
+
+  ❌ DO NOT allow couriers to self-register
+  ❌ DO NOT allow unactivated couriers to receive orders
 
 8.2 Order Handling
-Receives push notification with order details
-Sees delivery distance (store → customer) to decide acceptance
-20-second window to accept or reject
-Location updated periodically — rate-limited to prevent spam
-Customer receives real-time tracking via WebSocket
+-------------------
+  - Receives FCM push with order details + delivery distance
+  - 20-second window to accept or reject
+  - Location updated every 5 seconds max (rate-limited in Redis)
+  - Customer receives real-time tracking via WebSocket (order.{id})
 
 8.3 Courier Earnings
-Couriers are paid in cash directly by the customer at delivery. No wallet system exists. Earnings visibility is provided for transparency:
+---------------------
+  Cash paid directly by customer at delivery.
+  No wallet system exists.
+  Logged in courier_earnings table for transparency only.
 
-Table: courier_earnings
+  ❌ DO NOT implement wallet or balance system in Phase 1
 
-8.4 Admin Monthly Stats for Couriers
+8.4 Admin Monthly Stats
+------------------------
+  Stored in courier_monthly_stats:
+  month, deliveries_count, total_distance_km per courier.
 
 8.5 Courier Order Assignment — Notification Strategy
-Courier order assignment uses a Push + REST Fallback strategy to ensure reliability within the 20-second acceptance window.
-Primary Channel — FCM Push Notification
-When the system assigns an order to a courier, it immediately sends a Firebase Cloud Messaging (FCM) push notification to the courier's registered device token. The notification contains:
-FieldDescriptionorder_idThe assigned order IDstore_nameName of the store to pick up fromdelivery_distance_kmDistance from store to customerorder_totalTotal order valueexpires_atTimestamp when the 20s window closes
-The courier must accept or reject via POST /api/courier/orders/{id}/accept or /reject within 20 seconds. If no response is received, the system automatically cascades to the next nearest available courier.
-Fallback Channel — REST Endpoint
-The GET /api/courier/orders/available endpoint exists as a fallback only, not the primary assignment mechanism. It is called in two scenarios:
+------------------------------------------------------
+  Primary:  FCM push notification — instant, no persistent connection
+  Fallback: GET /api/courier/orders/available — called on app reopen
+            or FCM failure. Returns active assignment still in 20s window.
 
-The courier app reopens after being backgrounded or killed and may have missed a push notification
-FCM delivery fails or is delayed due to poor network conditions
+  Why NOT WebSocket for assignment:
+    Persistent background connection drains battery all day.
+    WebSocket reserved for customer tracking only.
 
-This endpoint returns any currently active assignment that is still within its 20-second window and waiting for a response.
-Why Not WebSocket?
-WebSocket was considered but rejected for the courier assignment channel because it requires a persistent background connection, which significantly drains battery on a device used for deliveries all day. WebSocket is reserved for customer-side real-time order tracking only (Section 11).
-Why Not Polling?
-Polling every few seconds is unsuitable for a 20-second acceptance window and would waste both battery and server resources. FCM push is instant and polling adds no value over the REST fallback.
+  Why NOT Polling:
+    20s window = only 4-6 polls — unreliable.
+    Wastes battery + server resources.
 
-9. Admin Panel
+  ❌ DO NOT use WebSocket for courier order assignment
+  ❌ DO NOT implement polling for courier assignment
+  ❌ DO NOT use customer address for courier search
+
+8.6 Delivery Confirmation — Courier Side [NEW v2.0]
+-----------------------------------------------------
+  When courier hands order to customer, they tap ONE clearly labeled button:
+
+    +-------------------------------+
+    |  Arrived at destination?      |
+    |                               |
+    |   [ Confirm Delivery ]        |
+    |                               |
+    |  Tap after customer receives  |
+    +-------------------------------+
+
+  Endpoint: POST /api/courier/orders/{id}/deliver
+  Result:   status → delivered, customer notified, stats updated
+
+  PROHIBITED CONFIRMATION METHODS
+  ================================
+  The following are explicitly PROHIBITED. Do NOT implement under
+  any circumstances to avoid interaction ambiguity, accidental
+  triggers, and courier fraud:
+
+    ❌ Long press
+       Reason: Easily abused — courier can trigger without delivering.
+               Unclear gesture — no standard duration known to users.
+
+    ❌ Swipe to confirm
+       Reason: Can be triggered accidentally while holding phone.
+
+    ❌ Auto-confirm on GPS proximity
+       Reason: GPS inaccurate inside buildings.
+               Easily spoofed — high fraud risk.
+
+    ❌ Timer-based auto-confirm
+       Reason: No human action required — highest fraud risk.
+
+    ❌ Double tap
+       Reason: Too easily triggered accidentally.
+
+    ❌ Shake gesture
+       Reason: Triggered accidentally during normal movement on bike/car.
+
+  These are prohibited to avoid:
+    1. Mixing interaction meanings across the app
+    2. Accidental delivery confirmation
+    3. Courier fraud (marking delivered without actual delivery)
+    4. Inconsistent user experience
+    5. Legal disputes with no proof of delivery action
+
+  PHASE 2 — Customer Confirmation Code (Future)
+  ===============================================
+  In Phase 2, a 4-digit code system will be introduced:
+
+    Step 1: Customer sees code (e.g. 4821) in Flutter app
+    Step 2: Courier asks customer for the code
+    Step 3: Courier enters code in courier app
+    Step 4: System confirms delivery automatically
+
+  Benefits:
+    - Guarantees customer was physically present
+    - Eliminates fraud possibility entirely
+    - Provides legal proof of delivery
+
+  Deferred to Phase 2 based on fraud reports data from Phase 1.
+
+  Summary:
+    Phase 1:  Single tap button → POST /api/courier/orders/{id}/deliver
+    Phase 2:  4-digit customer code → same endpoint + code validation
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. ADMIN PANEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 9.1 Admin Responsibilities
+---------------------------
+  - Create and manage store owners, stores, couriers
+  - Approve or reject menu change requests
+  - Review and resolve refund requests
+  - Review and resolve order issue reports
+  - Manage promo codes
+  - Monitor platform analytics
+  - Moderate reviews
+
 9.2 Store & Store Owner Creation (Admin Only)
-Store registration is fully admin-controlled. There is no self-registration flow for store owners. Stores are created directly by admin and are immediately live upon creation — no approval or pending state exists.
-Account Creation Flow
-Admin creates store owner account (email + password)
-        ↓
-Admin creates store and assigns it to that owner
-        ↓
-Admin sets category, location, and opening hours
-        ↓
-Admin contacts store owner out-of-band and shares credentials
-        ↓
-Store owner logs in via POST /api/auth/login and starts working immediately
-Credential Delivery
-Credentials are shared by the admin directly with the store owner through manual out-of-band communication (phone call, message, in-person). No automated SMS or email is sent by the system. This is intentional and follows the same pattern as courier account activation.
-Admin Endpoints
-EndpointDescriptionPOST /api/admin/store-ownersCreate a new store owner accountPOST /api/admin/storesCreate a new store and assign to ownerPUT /api/admin/stores/{id}Edit store details, category, or locationDELETE /api/admin/stores/{id}Deactivate a storeGET /api/admin/storesList all stores with status and owner info
-POST /api/admin/store-owners Request Body
-json{
-  "name": "Hassan Benali",
-  "email": "hassan@pizzahouse.ma",
-  "password": "securepassword",
-  "phone": "+212600123456"
-}
-POST /api/admin/stores Request Body
-json{
-  "owner_id": 5,
-  "name": "Pizza House Casablanca",
-  "category_id": 1,
-  "address": "123 Boulevard Mohammed V, Casablanca",
-  "lat": 33.5731,
-  "lng": -7.5898,
-  "logo": "logo.png"
-}
-Removed Endpoints
-The following endpoints are not needed and should be removed from the API guide as there is no store approval workflow:
-Removed EndpointReasonGET /api/admin/stores/pendingNo pending state existsPOST /api/admin/stores/{id}/approveNo approval workflow exists
+----------------------------------------------
+  No self-registration. Admin creates everything directly.
+  Stores are immediately live — no approval or pending state.
 
-10. Payment System
+  Endpoints:
+    POST   /api/admin/store-owners     — create owner account
+    POST   /api/admin/stores           — create store (immediately live)
+    PUT    /api/admin/stores/{id}      — edit store
+    DELETE /api/admin/stores/{id}      — deactivate store
+    GET    /api/admin/stores           — list all stores
+
+  Credentials shared out-of-band by admin (call/message). No automated delivery.
+
+  REMOVED ENDPOINTS — DO NOT IMPLEMENT:
+    ❌ GET  /api/admin/stores/pending      — no pending state
+    ❌ POST /api/admin/stores/{id}/approve — no approval workflow
+    ❌ POST /api/auth/register-store       — no public registration
+
+9.3 Admin Analytics Dashboard
+-------------------------------
+  Endpoint                           Description              Period Filter
+  ---------------------------------  -----------------------  -------------
+  GET /api/admin/analytics           KPI summary (all-time)   No
+  GET /api/admin/analytics/revenue   Daily revenue chart      Yes
+  GET /api/admin/analytics/orders    Orders by status         Yes
+  GET /api/admin/analytics/stores    Top 10 stores            Yes
+  GET /api/admin/analytics/couriers  Top 10 couriers          Yes
+
+  Period filter: ?period=week (7d) | month (30d, default) | all
+
+  ❌ DO NOT count cancelled/rejected orders in revenue
+  ❌ DO NOT include non-delivered orders in revenue calculations
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. PAYMENT SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 10.1 Supported Methods
+-----------------------
+  - Cash on delivery — primary and only method in Phase 1
+  - No wallet system
+  - Refunds processed offline — no automated money movement
 
-No wallet system exists in this version. Refunds are processed offline by admin via cash or bank transfer and logged in the refund_requests table.
+  ❌ DO NOT implement wallet, credits, or online payment in Phase 1
+  ❌ DO NOT automate refund money transfers
 
 10.2 Refund Endpoints & Flow
-Customers may only request a refund after the order status is delivered. Refunds are processed manually by admin — no automated money movement occurs.
-Customer Endpoints
-POST /api/refunds
-json{
-  "order_id": 99,
-  "reason": "Wrong items delivered"
-}
-ValidationRuleOrder must belong to authenticated customer403 if notOrder status must be delivered422 if notNo existing pending refund for same order422 if duplicate
-Response (201 Created):
-json{
-  "message": "Refund request submitted successfully.",
-  "refund_id": 12
-}
+------------------------------
+  Customer endpoints:
+    POST /api/refunds   — submit request
+    GET  /api/refunds   — list own requests
 
-GET /api/refunds
-Returns all refund requests submitted by the authenticated customer.
-Response (200 OK):
-json[
-  {
-    "id": 12,
-    "order_id": 99,
-    "reason": "Wrong items delivered",
-    "status": "pending",
-    "refund_method": null,
-    "admin_note": null,
-    "created_at": "2026-02-27T10:00:00Z",
-    "resolved_at": null
-  }
-]
+  Admin endpoints:
+    GET /api/admin/refunds                    — list all (?status=pending)
+    PUT /api/admin/refunds/{id}/approve       — approve (cash/bank_transfer)
+    PUT /api/admin/refunds/{id}/reject        — reject with admin_note
 
-Admin Endpoints
-GET /api/admin/refunds
-Returns paginated list of all refund requests filterable by status.
-Query Params: ?status=pending&page=1
+  Guards on POST /api/refunds:
+    - Order must belong to authenticated customer → 403
+    - Order status must be delivered → 422
+    - No existing pending refund for same order → 422
 
-PUT /api/admin/refunds/{id}/approve
-json{
-  "refund_method": "cash",
-  "admin_note": "Confirmed wrong items. Refund approved."
-}
-FieldTypeDescriptionrefund_methodenumcash or bank_transferadmin_notetext NULLABLEOptional note visible to customer
+  On resolution: customer notified via FCM push + SMS (both channels).
 
-PUT /api/admin/refunds/{id}/reject
-json{
-  "admin_note": "Order was delivered correctly based on store confirmation."
-}
-
-Customer Notification on Resolution
-When admin approves or rejects a refund, the customer is notified via both FCM push notification and SMS:
-EventPush MessageSMS MessageApproved"Your refund for order #99 has been approved. You will receive your money via cash/bank transfer."Same message via SMSRejected"Your refund request for order #99 has been reviewed. Please check the app for details."Same message via SMS
-Both the push notification and SMS are logged in the sms_logs table and the notifications table respectively.
-refund_requests Table — Updated Fields
-FieldTypeDescriptionidbigint PKorder_idFK → ordersuser_idFK → usersreasontextCustomer's reasonstatusenumpending / approved / rejectedrefund_methodenum NULLABLEcash or bank_transferadmin_notetext NULLABLEAdmin resolution noteresolved_attimestamp NULLABLEWhen admin actedcreated_attimestampWhen customer submitted
+  ❌ DO NOT allow refund request before delivered status
+  ❌ DO NOT allow duplicate pending refunds for same order
+  ❌ DO NOT process refund automatically — admin manual only
 
 10.3 Promo Codes & Admin Management
-The promo_codes table supports flexible discount configuration managed exclusively by admin. Each promo code can be restricted to specific categories or applied globally across all categories.
-Promo Code Structure
-The eligible_categories field controls scope:
+-------------------------------------
+  eligible_categories:
+    null or empty array → applies to all categories
+    [1, 2] → restricted to those category IDs only
 
-Empty array or null → applies to all categories (Food, Pharmacy, Market, Smoking)
-Array of category IDs → restricted to specified categories only (e.g. Food only, or Food + Pharmacy)
+  Validation at checkout (in order):
+    1. Code exists and is_active = true
+    2. Not expired
+    3. Usage limit not exceeded
+    4. Cart total >= min_order_amount
+    5. Store category in eligible_categories (if set)
 
-Admin Endpoints
-EndpointDescriptionPOST /api/admin/promo-codesCreate a new promo codeGET /api/admin/promo-codesList all promo codes with usage statsPUT /api/admin/promo-codes/{id}Edit or deactivate an existing promo codeDELETE /api/admin/promo-codes/{id}Delete a promo code
-Promo Code Fields
-FieldTypeDescriptioncodevarcharUnique coupon stringdiscount_typeenumpercentage or fixeddiscount_valuedecimalAmount or percentage to deducteligible_categoriesjsonbArray of category IDs. Null = all categoriesmin_order_amountdecimalMinimum cart total to apply. Null = no minimummax_usesintTotal usage limit. Null = unlimitedexpires_attimestampExpiry date. Null = no expiryis_activebooleanAdmin can disable without deleting
-Validation Logic at Checkout
-When a customer applies a promo code at checkout, the backend validates in this order:
+  Admin endpoints:
+    POST   /api/admin/promo-codes      — create
+    GET    /api/admin/promo-codes      — list with usage stats
+    PUT    /api/admin/promo-codes/{id} — edit or deactivate
+    DELETE /api/admin/promo-codes/{id} — delete
 
-Code exists and is_active = true
-Not expired (expires_at is null or in the future)
-Usage limit not exceeded (max_uses is null or current uses < max_uses)
-Cart total meets min_order_amount
-Store's category is in eligible_categories (resolved via stores → category_id join). If eligible_categories is empty or null, this check is skipped.
-
-If all checks pass, the discount is applied and a record is inserted into promo_code_uses.
-
-You can place this under Section 10 — Payment System, right after 10.2 Refund Flow.
+  ❌ DO NOT allow customers to create or modify promo codes
+  ❌ DO NOT skip category eligibility check at checkout
 
 
-11. Notifications & Real-Time Tracking
-11.1 Notification Channels
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. NOTIFICATIONS & REAL-TIME TRACKING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+11.1 Notification Events
+-------------------------
+  Event                          Recipient     Channel
+  -----------------------------  ------------  ----------------
+  New order placed               Store owner   SMS + FCM push
+  Store verified & confirmed     Customer      FCM push
+  Store rejected order           Customer      FCM push + SMS
+  Courier assigned               Customer      FCM push
+  Courier picked up order        Customer      FCM push
+  Order delivered                Customer      FCM push
+  New order assignment (20s)     Courier       FCM push
+  Menu change approved/rejected  Store owner   FCM push
+  Refund approved/rejected       Customer      FCM push + SMS
+  Report received confirmation   Customer      FCM push
+  OTP verification               Customer      SMS
+
+  ❌ DO NOT use polling for real-time order status on customer side
+  ❌ DO NOT use WebSocket for courier assignment notifications
 
 11.2 SMS Provider Requirements
-Must support Moroccan phone numbers (+212)
-Must provide Sender ID (check license requirements with ANRT)
-All SMS events logged in sms_logs table for dispute handling
-Recommended providers: Twilio, Vonage, or local Moroccan gateway
+--------------------------------
+  - Must support Moroccan numbers (+212)
+  - Must provide Sender ID (ANRT compliance)
+  - All SMS logged in sms_logs table
 
-11.3 Mobile Framework & Push Notification Provider
-The Falco Delivery mobile application is built using Flutter, targeting Android and iOS from a single codebase. Flutter was selected for its native performance, built-in RTL (Right-to-Left) support for Arabic, and strong presence in the Moroccan Android-dominant market.
-Push Notification Stack
-Push notifications are delivered via Firebase Cloud Messaging (FCM) directly, with no dependency on Expo or any third-party notification proxy.
-Device Token Registration
-When the app launches and the user grants notification permission, the Flutter app retrieves the FCM token from Firebase and registers it with the backend:
-POST /api/notifications/device-token
-json{
-  "token": "fcm_device_token_here",
-  "platform": "android"
-}
-FieldTypeDescriptiontokenvarcharFCM device token from Firebaseplatformenumandroid or ios
-Backend Requirements
-The backend must integrate the Firebase Admin SDK (available as a Laravel package) to send push notifications to FCM tokens. The device_tokens table should store one active token per user/device, updated on every app launch to handle token rotation.
-Notification Events That Trigger a Push
-EventRecipientOrder placedStore ownerOrder accepted by storeCustomerCourier assignedCustomerCourier picked up orderCustomerOrder deliveredCustomerNew order assignmentCourier (20s window)Menu change request approved/rejectedStore ownerRefund request approved/rejectedCustomer
+  Recommended:
+    Development/MVP:  Twilio (sandbox mode, free trial)
+    Production:       D7 Networks (direct Maroc Telecom/Orange/Inwi)
 
-12. Security Requirements
+  ❌ DO NOT go to production without ANRT-compliant Sender ID
 
+11.3 Mobile Framework & Push Notifications
+-------------------------------------------
+  Framework:  Flutter — iOS + Android single codebase
+  Push:       Firebase Cloud Messaging (FCM) — no Expo dependency
+  Tracking:   WebSocket channel order.{id} — event: CourierLocationUpdated
 
-13. Localization & Language Support
-13.1 Supported Languages
+  Device token registered on app launch:
+    POST /api/notifications/device-token
+    { "token": "fcm_token", "platform": "android" }
 
-13.2 Implementation Approach (Option A — Static i18n)
-All UI strings stored in 4 JSON translation files on the frontend
-Default language detected from device locale — user can switch manually
-Language preference stored on device (local storage / async storage)
-Backend returns raw data in whatever language the owner entered — no backend translation
-Arabic requires RTL layout support — must be configured in the frontend framework from day one
-Store and product names are entered by owners in their preferred language — no multi-language DB content in Phase 1
+  ❌ DO NOT use Expo push notifications — FCM directly only
+  ❌ DO NOT use WebSocket for courier assignment (battery drain)
+  ❌ DO NOT forget RTL configuration for Arabic from day one
 
 
-14. Performance Requirements
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+12. SECURITY REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - All endpoints: auth:sanctum middleware (except public browse)
+  - Role middleware: role:admin, role:restaurant_owner, role:courier
+  - EnsureCourierIsActivated on all courier routes
+  - OTP rate limited: 3 per 10min per phone (Redis)
+  - Location update rate limited: 1 per 5s per courier (Redis)
+
+  ❌ DO NOT expose admin endpoints without role:admin middleware
+  ❌ DO NOT allow unactivated couriers to receive orders
+  ❌ DO NOT skip rate limiting on OTP endpoint
 
 
-15. Scalability Roadmap
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+13. LOCALIZATION & LANGUAGE SUPPORT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Language   Code  Direction
+  ---------  ----  ---------
+  Arabic     ar    RTL — configured in Flutter from day one
+  French     fr    LTR
+  Darija     dar   RTL
+  English    en    LTR
+
+  - All UI strings in 4 JSON translation files (Flutter frontend)
+  - Default from device locale — user can switch manually
+  - Backend returns raw data — no backend translation in Phase 1
+
+  ❌ DO NOT implement backend translation in Phase 1
+  ❌ DO NOT add RTL support as an afterthought — configure from day one
 
 
-16. KPIs & Success Metrics
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+14. PERFORMANCE REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Metric                    Target
+  ------------------------  ---------------
+  API response time (p95)   < 300ms
+  OTP delivery              < 10 seconds
+  Courier location update   Max 1 per 5s
+  WebSocket latency         < 500ms
+  Concurrent users Phase 1  500+
 
 
-17. Legal & Compliance (Morocco)
-Age-restricted products require self-declaration confirmation — modal must be shown and cannot be bypassed
-age_confirmation_at timestamp stored on every order containing restricted items
-SMS logs retained for dispute handling and telecom compliance
-ToS acceptance logged per user with version, timestamp, and IP address
-SMS Sender ID and campaigns must comply with ANRT (Agence Nationale de Réglementation des Télécommunications) regulations
-No biometric or ID verification required in Phase 1 — self-declaration model only
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+15. SCALABILITY ROADMAP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Phase 1  Scalable monolith — Laravel + PostgreSQL + Redis
+  Phase 2  Extract courier tracking to separate microservice
+  Phase 3  Add read replicas for analytics queries
+  Phase 4  Message queue (Horizon) for heavy notification load
 
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+16. KPIs & SUCCESS METRICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  KPI                              Target (Month 3)
+  -------------------------------  ----------------
+  Active customers                 500+
+  Orders per day                   100+
+  Average order value              120 MAD+
+  Courier acceptance rate          > 85%
+  Order completion rate            > 90%
+  Store verification call rate     > 95%
+  Average delivery time            < 45 min
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+17. LEGAL & COMPLIANCE (MOROCCO)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  - Age modal required — cannot be bypassed — age_confirmation_at logged
+  - SMS logs retained for dispute handling and telecom compliance
+  - ToS logged: user_id, tos_version, ip_address, accepted_at
+  - SMS Sender ID must comply with ANRT regulations
+  - No biometric or ID verification in Phase 1 — self-declaration only
+  - Customer phone visible to store for verification — logged in sms_logs
+
+  ❌ DO NOT go to production without ANRT-registered Sender ID
+  ❌ DO NOT bypass age confirmation modal under any circumstances
+  ❌ DO NOT delete ToS acceptance logs — legal requirement
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+18. REVIEWS & RATINGS SYSTEM [NEW v2.0]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+18.1 Product Review — Triggered at Delivery
+---------------------------------------------
+  When status changes to delivered, Flutter auto-shows rating popup
+  for each product in the order.
+
+  Rules:
+    - Customer rates each product (1-5 stars)
+    - Optional text comment (max 300 chars)
+    - Skip button — never mandatory
+    - One review per order_item_id — cannot submit twice
+
+  Endpoint: POST /api/reviews/products
+  Guards:
+    - Order must belong to customer → 403
+    - Status must be delivered → 422
+    - No existing review for same order_item_id → 422
+
+  ❌ DO NOT make product review mandatory
+  ❌ DO NOT allow review before delivered status
+  ❌ DO NOT allow duplicate reviews for same order_item_id
+
+18.2 Store Review — Available Anytime
+---------------------------------------
+  Customer can rate a store anytime from the store page.
+
+  Rules:
+    - Only if customer has at least one delivered order from that store
+    - 1-5 stars + optional comment (max 500 chars)
+    - One review per customer per store — can update anytime (upsert)
+    - Publicly visible on store page
+
+  Endpoints:
+    POST /api/reviews/stores       — create or update (upsert)
+    GET  /api/stores/{id}/reviews  — paginated public reviews (no auth)
+
+  ❌ DO NOT allow review from customer with no delivered order from that store
+  ❌ DO NOT create duplicate store reviews — use upsert
+
+18.3 Database Schema — reviews table
+--------------------------------------
+  id, user_id, store_id (nullable), order_item_id (nullable),
+  order_id, type (store/product), rating (1-5), comment, deleted_at
+
+  Unique constraints:
+    (user_id, store_id)       — one store review per customer per store
+    (user_id, order_item_id)  — one product review per order item
+
+18.4 Average Ratings — Computed at Query Time
+-----------------------------------------------
+  No dedicated rating columns — computed via SQL and appended to responses.
+
+  ❌ DO NOT add average_rating column to stores or products tables
+  ❌ DO NOT cache ratings without invalidation on new review
+
+18.5 Admin Moderation
+-----------------------
+  Admin can soft-delete reviews: DELETE /api/admin/reviews/{id}
+  No edit capability — keep or remove only.
+
+  ❌ DO NOT hard-delete reviews — soft delete only (deleted_at)
+  ❌ DO NOT allow admin to edit review content
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+19. ORDER ISSUE REPORTING SYSTEM [NEW v2.0]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Separate from refunds — operational complaints handled by admin only.
+
+19.1 When Can a Customer Report
+---------------------------------
+  Moment             Eligible Statuses
+  -----------------  -------------------------------------------
+  During order       courier_assigned, preparing, ready, picked_up
+  After delivery     delivered — within 24 hours ONLY
+
+  One report per order maximum.
+
+  ❌ DO NOT allow report after 24h from delivered status
+  ❌ DO NOT allow second report on same order
+
+19.2 Report Categories & Priority
+-----------------------------------
+  Type                Priority   Description
+  ------------------  ---------  ------------------------------------
+  courier_no_show     HIGH       Courier accepted but never arrived
+  courier_behavior    HIGH       Inappropriate courier behavior
+  late_delivery       MEDIUM     Delivery taking too long
+  missing_items       MEDIUM     Order arrived with missing products
+  wrong_items         MEDIUM     Received wrong products
+  store_issue         MEDIUM     Problem from the store side
+  damaged_product     NORMAL     Product arrived damaged or expired
+  other               NORMAL     Free-text for anything else
+
+19.3 Customer Flow
+-------------------
+  Customer taps "Report an Issue"
+          ↓
+  Selects category
+          ↓
+  Optional description (max 500 chars)
+          ↓
+  POST /api/reports
+          ↓
+  Confirmation shown + FCM push sent:
+  "بلاغك وصل، سنتصل بك قريباً"
+  "Your report has been received. We will contact you shortly."
+
+19.4 Endpoints
+---------------
+  POST /api/reports                      — customer submits
+  GET  /api/reports                      — customer lists own reports
+  GET  /api/admin/reports                — admin lists all (?status=open&type=)
+  PUT  /api/admin/reports/{id}/resolve   — admin resolves
+
+  Guards on POST /api/reports:
+    - Order belongs to customer → 403
+    - Status active or delivered within 24h → 422
+    - No existing report for same order → 422
+
+  ❌ DO NOT allow report on cancelled or rejected orders
+  ❌ DO NOT allow store or courier to see reports — admin only
+
+19.5 Database Schema — order_reports
+--------------------------------------
+  id, order_id, user_id, type (enum), description, status (open/resolved),
+  admin_response, action_taken, resolved_at
+
+  Unique constraint: (user_id, order_id)
+
+19.6 Admin Notifications on New Report
+----------------------------------------
+  HIGH priority reports trigger immediate FCM push to admin.
+  Medium and Normal appear in queue sorted by priority.
+
+  ❌ DO NOT notify store or courier of reports — admin only
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK REFERENCE — ALL PROHIBITED ACTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Authentication & OTP:
+  ❌ Store OTP in DB before verification
+  ❌ Allow more than 3 OTP attempts per 10 minutes
+  ❌ Validate ToS at request-otp step
+  ❌ Create account without tos_accepted: true (new phone)
+  ❌ Delete ToS acceptance logs
+
+Order Flow:
+  ❌ Start courier search before store_confirmed
+  ❌ Use old status literals: assigned, on_the_way
+  ❌ Skip store_notified step
+  ❌ Hide customer phone from store owner
+  ❌ Auto-accept orders on store's behalf
+  ❌ Silently drop unavailable products on reorder
+
+Courier:
+  ❌ Allow unactivated couriers to receive orders
+  ❌ Use WebSocket for courier assignment
+  ❌ Implement polling for courier assignment
+  ❌ Use customer address for courier search radius
+  ❌ Long press for delivery confirmation
+  ❌ Swipe to confirm delivery
+  ❌ Auto-confirm on GPS proximity
+  ❌ Timer-based auto-confirm
+  ❌ Double tap for delivery confirmation
+  ❌ Shake gesture for delivery confirmation
+
+Payment & Wallet:
+  ❌ Implement wallet or balance system in Phase 1
+  ❌ Automate refund money transfers
+  ❌ Allow refund request before delivered status
+  ❌ Allow duplicate pending refunds for same order
+
+Admin & Stores:
+  ❌ GET /api/admin/stores/pending
+  ❌ POST /api/admin/stores/{id}/approve
+  ❌ POST /api/auth/register-store
+  ❌ Allow store owners to directly modify products table
+  ❌ Auto-approve menu changes
+  ❌ Count non-delivered orders in revenue analytics
+
+Notifications:
+  ❌ Use Expo push notifications — FCM directly only
+  ❌ Use WebSocket for courier assignment
+  ❌ Go to production without ANRT Sender ID
+
+Reviews:
+  ❌ Make product review mandatory
+  ❌ Allow review before delivered status
+  ❌ Duplicate store reviews — use upsert
+  ❌ Hard-delete reviews — soft delete only
+  ❌ Add average_rating column to stores/products tables
+
+Reports:
+  ❌ Allow report after 24h from delivery
+  ❌ Allow second report on same order
+  ❌ Show reports to store or courier — admin only
+
+Legal:
+  ❌ Bypass age confirmation modal
+  ❌ Store birthdate — self-declaration only
+  ❌ Delete sms_logs or audit_logs
+  ❌ Go live without ANRT-compliant Sender ID
+
+Database:
+  ❌ Hardcode cost_per_km — must come from settings table
+  ❌ Use Haversine manually — use PostGIS ST_Distance SRID 4326
+  ❌ Add wallet/balance fields to users table
+
+
+========================================================
+END OF DOCUMENT
+FALCO DELIVERY — PRD v2.0 — Laâyoune, Maroc — March 2026
+========================================================

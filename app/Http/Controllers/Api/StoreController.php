@@ -14,14 +14,10 @@ class StoreController extends Controller
      */
     public function index(Request $request)
     {
-        $query = Store::withCoordinates()->where('is_approved', true);
+        $query = Store::withCoordinates();
 
         if ($request->has('category_id')) {
             $query->where('category_id', $request->category_id);
-        }
-
-        if ($request->has('rating')) {
-            $query->where('rating', '>=', $request->rating);
         }
 
         return response()->json($query->paginate(15));
@@ -38,9 +34,12 @@ class StoreController extends Controller
         ]);
 
         $stores = Store::withCoordinates()
-            ->where('is_approved', true)
             ->nearby($request->lat, $request->lng, 10)
-            ->get();
+            ->with(['hours', 'closures'])
+            ->get()
+            ->map(fn($store) => array_merge($store->toArray(), [
+                'is_currently_open' => $store->isCurrentlyOpen(),
+            ]));
 
         return response()->json($stores);
     }

@@ -12,13 +12,11 @@ class Store extends Model
 
     protected $fillable = [
         'user_id', 'category_id', 'name', 'category', 'address', 'phone',
-        'description', 'image', 'rating', 'is_approved', 'is_open', 'location',
+        'description', 'image', 'location',
     ];
 
     protected $casts = [
-        'is_approved' => 'boolean',
-        'is_open'     => 'boolean',
-        'rating'      => 'float',
+        'rating' => 'float',
     ];
 
     // --- PostGIS Coordinate Extraction ---

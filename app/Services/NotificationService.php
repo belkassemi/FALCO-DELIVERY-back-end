@@ -49,4 +49,12 @@ class NotificationService
     {
         return $this->send($customer, $title, $body, 'order_update', $data);
     }
+
+    /**
+     * Generic: send notification to any user.
+     */
+    public function sendToUser(User $user, string $title, string $body, array $data = [])
+    {
+        return $this->send($user, $title, $body, 'system', $data);
+    }
 }

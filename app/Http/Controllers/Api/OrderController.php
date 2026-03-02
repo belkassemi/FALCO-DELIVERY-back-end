@@ -11,6 +11,8 @@ use App\Models\Address;
 use App\Services\DispatchService;
 use App\Services\LogService;
 use App\Services\DeliveryFeeService;
+use App\Services\NotificationService;
+use App\Services\SmsService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -19,15 +21,21 @@ class OrderController extends Controller
     protected DispatchService $dispatchService;
     protected LogService $logService;
     protected DeliveryFeeService $deliveryFeeService;
+    protected NotificationService $notificationService;
+    protected SmsService $smsService;
 
     public function __construct(
         DispatchService $dispatchService,
         LogService $logService,
-        DeliveryFeeService $deliveryFeeService
+        DeliveryFeeService $deliveryFeeService,
+        NotificationService $notificationService,
+        SmsService $smsService
     ) {
-        $this->dispatchService    = $dispatchService;
-        $this->logService         = $logService;
-        $this->deliveryFeeService = $deliveryFeeService;
+        $this->dispatchService      = $dispatchService;
+        $this->logService           = $logService;
+        $this->deliveryFeeService   = $deliveryFeeService;
+        $this->notificationService  = $notificationService;
+        $this->smsService           = $smsService;
     }
 
     public function store(Request $request)
@@ -39,6 +47,7 @@ class OrderController extends Controller
             'items.*.id'        => 'required|exists:products,id',
             'items.*.qty'       => 'required|integer|min:1',
             'age_confirmation'  => 'sometimes|boolean',
+            'customer_note'     => 'nullable|string|max:500',
         ]);
 
         return DB::transaction(function () use ($request) {
@@ -46,12 +55,9 @@ class OrderController extends Controller
             $orderItems = [];
             $hasAgeRestricted = false;
 
-            // Store guards: must be approved and currently open
+            // Store guard: must be currently open (PRD §7.1 — auto-computed, no manual toggle)
             $store = Store::findOrFail($request->store_id);
-            if (!$store->is_approved) {
-                return response()->json(['error' => 'This store is not available.'], 400);
-            }
-            if (!$store->isCurrentlyOpen() && !$store->is_open) {
+            if (!$store->isCurrentlyOpen()) {
                 return response()->json(['error' => 'This store is currently closed.'], 400);
             }
             if ($store->owner && $store->owner->status !== 'active') {
@@ -74,7 +80,7 @@ class OrderController extends Controller
                 ];
             }
 
-            // PRD: age-restricted products require explicit self-declaration
+            // PRD §6: age-restricted products require explicit self-declaration
             if ($hasAgeRestricted && !$request->boolean('age_confirmation')) {
                 return response()->json([
                     'requires_age_confirmation' => true,
@@ -82,26 +88,44 @@ class OrderController extends Controller
                 ], 422);
             }
 
-            // Calculate delivery fee using Haversine
+            // Calculate delivery fee using PostGIS
             $address = Address::findOrFail($request->address_id);
             $feeData = $this->deliveryFeeService->calculate($store, $address);
 
+            // PRD §5.7: Initial status is store_notified — courier search does NOT start here
             $order = Order::create([
-                'customer_id'         => auth('api')->id(),
-                'store_id'            => $request->store_id,
-                'address_id'          => $request->address_id,
-                'total_price'         => $totalPrice,
-                'delivery_fee'        => $feeData['fee'],
+                'customer_id'          => auth('api')->id(),
+                'store_id'             => $request->store_id,
+                'address_id'           => $request->address_id,
+                'total_price'          => $totalPrice,
+                'delivery_fee'         => $feeData['fee'],
                 'delivery_distance_km' => $feeData['distance_km'],
-                'status'              => 'pending',
-                'age_confirmation'    => $hasAgeRestricted ? true : false,
-                'age_confirmation_at' => $hasAgeRestricted ? now() : null,
+                'status'               => Order::STATUS_STORE_NOTIFIED,
+                'age_confirmation'     => $hasAgeRestricted ? true : false,
+                'age_confirmation_at'  => $hasAgeRestricted ? now() : null,
+                'customer_note'        => $request->customer_note,
             ]);
 
             $order->items()->createMany($orderItems);
 
             $this->logService->log('order_created', $order);
-            $this->dispatchService->dispatchOrder($order);
+
+            // PRD §5.7: Notify store via SMS + FCM dashboard
+            $customer = auth('api')->user();
+            $smsMessage = "[FALCO DELIVERY] طلب جديد\n"
+                . "الزبون: {$customer->name} — {$customer->phone}\n"
+                . "المبلغ: " . number_format($totalPrice, 2) . " درهم\n"
+                . "الرجاء التحقق والرد على لوحة التحكم";
+
+            if ($store->owner) {
+                $this->smsService->send($store->owner->phone, $smsMessage, 'order_notification');
+                $this->notificationService->sendToUser(
+                    $store->owner,
+                    'New Order',
+                    "New order from {$customer->name} — " . number_format($totalPrice, 2) . " MAD",
+                    ['order_id' => $order->id, 'type' => 'new_order']
+                );
+            }
 
             return response()->json([
                 'order_id'       => $order->id,
@@ -109,7 +133,7 @@ class OrderController extends Controller
                 'total_price'    => $order->total_price,
                 'delivery_fee'   => $order->delivery_fee,
                 'distance_km'    => $order->delivery_distance_km,
-                'message'        => 'Order created successfully'
+                'message'        => 'Order created successfully. Store has been notified.'
             ], 201);
         });
     }
@@ -187,30 +211,6 @@ class OrderController extends Controller
             ->findOrFail($id);
 
         return response()->json($order);
-    }
-
-    public function confirmDelivery($id)
-    {
-        $order = Order::where('customer_id', auth('api')->id())->findOrFail($id);
-
-        if ($order->status !== 'on_the_way') {
-            return response()->json(['error' => 'Order must be on the way before confirming delivery.'], 400);
-        }
-
-        $order->update(['status' => 'delivered', 'payment_status' => 'paid']);
-        $this->logService->log('delivery_confirmed', $order);
-
-        return response()->json(['message' => 'Delivery confirmed. Thank you!', 'status' => 'delivered']);
-    }
-
-    public function reportIssue(Request $request, $id)
-    {
-        $request->validate(['issue' => 'required|string|max:1000']);
-
-        $order = Order::where('customer_id', auth('api')->id())->findOrFail($id);
-        $this->logService->log('issue_reported', $order, ['issue' => $request->issue]);
-
-        return response()->json(['message' => 'Issue reported successfully. Our team will review it shortly.']);
     }
 
     public function history()

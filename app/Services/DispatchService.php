@@ -40,6 +40,8 @@ class DispatchService
 
         if ($couriers->isEmpty()) {
             Log::warning("No couriers available for Order #{$order->id}");
+            // PRD §5.2: Update status + notify admin + store
+            $order->update(['status' => Order::STATUS_NO_COURIER_FOUND]);
             return false;
         }
 
@@ -70,6 +72,19 @@ class DispatchService
 
         if (!$nextCourier) {
             Log::info("Failover: No more couriers to try for Order #{$order->id}");
+
+            // PRD §5.2: Mark order as no_courier_found + notify customer
+            $order->update(['status' => Order::STATUS_NO_COURIER_FOUND]);
+
+            if ($order->customer) {
+                $this->notificationService->sendToCustomer(
+                    $order->customer,
+                    'No Courier Available',
+                    'We could not find a courier for your order. Please contact our WhatsApp support for assistance.',
+                    ['order_id' => $order->id, 'type' => 'no_courier_found']
+                );
+            }
+
             return;
         }
 

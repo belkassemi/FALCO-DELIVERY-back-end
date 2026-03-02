@@ -23,8 +23,18 @@ class NotificationController extends Controller
 
     public function registerDeviceToken(Request $request)
     {
-        $request->validate(['device_token' => 'required|string']);
-        auth('api')->user()->update(['device_token' => $request->device_token]);
+        $request->validate([
+            'token'    => 'required|string',
+            'platform' => 'required|in:android,ios',
+        ]);
+
+        // PRD §4.8: Store in device_tokens table (supports multiple devices)
+        $user = auth('api')->user();
+        \App\Models\DeviceToken::updateOrCreate(
+            ['user_id' => $user->id, 'token' => $request->token],
+            ['platform' => $request->platform]
+        );
+
         return response()->json(['message' => 'Device token registered successfully.']);
     }
 

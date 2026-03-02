@@ -94,4 +94,9 @@ class User extends Authenticatable implements JWTSubject
     {
         return $this->hasMany(TosAcceptance::class);
     }
+
+    public function deviceTokens()
+    {
+        return $this->hasMany(DeviceToken::class);
+    }
 }

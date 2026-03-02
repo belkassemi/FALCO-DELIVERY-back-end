@@ -6,5 +6,8 @@ use Illuminate\Database\Eloquent\Model;
 
 class SmsLog extends Model
 {
-    protected $fillable = ['phone_number', 'message_type', 'provider_response', 'status'];
+    protected $fillable = [
+        'phone_number', 'message_type', 'provider_response', 'status',
+        'provider', 'provider_message_id',
+    ];
 }

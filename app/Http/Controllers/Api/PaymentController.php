@@ -149,4 +149,14 @@ class PaymentController extends Controller
             Refund::where('id', $id)->where('user_id', auth('api')->id())->firstOrFail()
         );
     }
+
+    /**
+     * GET /api/refunds  (PRD §10.2 — customer views all their refund requests)
+     */
+    public function listRefunds()
+    {
+        return response()->json(
+            Refund::where('user_id', auth('api')->id())->latest()->get()
+        );
+    }
 }
